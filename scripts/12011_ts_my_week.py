@@ -245,6 +245,10 @@ def refresh_submissions():
 # Two Data Apps cannot import each other, so this block is duplicated.
 # Edit it in one place and copy it to the other.
 #
+# One view per calendar month: ts_reporting.v_monthly_entries_2026_08 and
+# so on. The month window is baked into each view's SQL, so reading one
+# needs no date filter - ask for the month by name.
+#
 # Sourced from the live ts_prod tables on purpose, NOT from
 # ts_reporting.fact_timetable: that one is a materialized query table and
 # does not reflect writes until its underlying query is re-run (see the
@@ -253,9 +257,35 @@ def refresh_submissions():
 # =====================================================
 
 VIEW_SCHEMA = "ts_reporting"
-VIEW_NAME = "v_monthly_entries"
+VIEW_PREFIX = "v_monthly_entries_"
 
-MONTHLY_VIEW_SQL = f"""
+EXPORT_COLUMNS = [
+    ("employee", "Employee"),
+    ("entry_day", "Date"),
+    ("start_time", "Start"),
+    ("duration_hours", "Hours"),
+    ("client", "Client"),
+    ("project", "Project"),
+    ("task", "Task"),
+    ("note", "Note"),
+    ("approved", "Approved"),
+]
+
+
+def month_bounds(month_start):
+    """(first day, first day of next month) - one view's window."""
+    if month_start.month == 12:
+        return month_start, date(month_start.year + 1, 1, 1)
+    return month_start, date(month_start.year, month_start.month + 1, 1)
+
+
+def view_name(month_start):
+    return f"{VIEW_PREFIX}{month_start.strftime('%Y_%m')}"
+
+
+def monthly_view_sql(month_start):
+    start, end = month_bounds(month_start)
+    return f"""
 SELECT
     t.id                                      AS entry_id,
     t.user_id::text                           AS user_id,
@@ -274,58 +304,38 @@ LEFT JOIN {S}.users    u  ON u.id::text = t.user_id::text
 LEFT JOIN {S}.tasks    tk ON tk.id = t.task_id
 LEFT JOIN {S}.projects p  ON p.id = tk.project_id
 LEFT JOIN {S}.clients  c  ON c.id = p.client_id
+WHERE t.date >= TIMESTAMP '{start.isoformat()} 00:00:00'
+  AND t.date <  TIMESTAMP '{end.isoformat()} 00:00:00'
 ORDER BY employee, t.date
 """
 
-EXPORT_COLUMNS = [
-    ("employee", "Employee"),
-    ("entry_day", "Date"),
-    ("start_time", "Start"),
-    ("duration_hours", "Hours"),
-    ("client", "Client"),
-    ("project", "Project"),
-    ("task", "Task"),
-    ("note", "Note"),
-    ("approved", "Approved"),
-]
 
-
-def ensure_monthly_view():
+def ensure_monthly_view(month_start):
     """
-    Create the view, or update it in place when the SQL below changed.
+    Create this month's view, or update it in place when the SQL changed.
     Idempotent: upsert_query looks the table up by name first and only
     falls back to creating it when it does not exist yet.
     """
     return pq.upsert_query(
-        name=VIEW_NAME,
-        query=MONTHLY_VIEW_SQL,
+        name=view_name(month_start),
+        query=monthly_view_sql(month_start),
         schema_name=VIEW_SCHEMA,
         database_name=DW_NAME,
         as_view=True,
     )
 
 
-def month_bounds(month_start):
-    """(first day, first day of next month) - the export window."""
-    if month_start.month == 12:
-        return month_start, date(month_start.year + 1, 1, 1)
-    return month_start, date(month_start.year, month_start.month + 1, 1)
-
-
 def fetch_month(month_start, user_id=None):
     """
-    Rows from the view for one calendar month, ordered employee then date.
+    One month's view, ordered employee then date. The view is already
+    scoped to the month, so only the employee filter is applied here.
     user_id=None means every employee.
     """
-    start, end = month_bounds(month_start)
-    where = (f"entry_date >= TIMESTAMP '{start.isoformat()} 00:00:00' "
-             f"AND entry_date < TIMESTAMP '{end.isoformat()} 00:00:00'")
-    if user_id is not None:
-        where += f" AND user_id = '{int(user_id)}'"
+    where = "" if user_id is None else f"WHERE user_id = '{int(user_id)}'"
     dbconn = pq.dbconnect(DW_NAME)
     rows = dbconn.fetch(DW_NAME, query=f"""
-        SELECT * FROM {VIEW_SCHEMA}.{VIEW_NAME}
-        WHERE {where}
+        SELECT * FROM {VIEW_SCHEMA}.{view_name(month_start)}
+        {where}
         ORDER BY employee, entry_date
     """) or []
     df = pd.DataFrame(rows)
@@ -572,6 +582,91 @@ def validate_dialog(target_user, week_start, validated_by_id, existing_submissio
     if st.button("Validate week", type="primary", use_container_width=True, key="validate_ok"):
         validate_week(to_int(target_user.get("id")), week_start, validated_by_id, existing_submission)
         st.rerun()
+
+
+def month_options(around):
+    """The last 13 months, newest first, plus the month being viewed."""
+    today = date.today()
+    m = date(today.year, today.month, 1)
+    out = []
+    for _ in range(13):
+        out.append(m)
+        m = date(m.year - 1, 12, 1) if m.month == 1 else date(m.year, m.month - 1, 1)
+    if around not in out:
+        out.append(around)
+        out.sort(reverse=True)
+    return out
+
+
+def name_slug(user):
+    text = str(user_display_name(user)).lower()
+    return "".join(ch if ch.isalnum() else "_" for ch in text).strip("_") or "employee"
+
+
+@st.dialog("Export to Excel")
+def export_dialog(viewer, viewer_id, can_manage, user_ids, user_by_id, default_month):
+    """
+    Pick a month and whose entries, build the file, then download it.
+
+    Two steps on purpose: building means asserting the month's view and
+    querying it, which is too slow to do on every keystroke, and
+    st.download_button needs the bytes in hand before it can be drawn.
+
+    Scope 1 exports only their own month - offering "all employees" to
+    everyone would hand out far more than the calendar ever shows them.
+    """
+    months = month_options(default_month)
+    export_month = st.selectbox(
+        "Month", months, index=months.index(default_month), key="export_month",
+        format_func=lambda d: d.strftime("%B %Y"),
+    )
+
+    if can_manage:
+        export_who = st.selectbox(
+            "Employees", ["all"] + user_ids, index=0, key="export_who",
+            format_func=lambda w: ("All employees" if w == "all"
+                                   else user_display_name(user_by_id[w])),
+        )
+    else:
+        export_who = viewer_id
+        st.text_input("Employees", value=user_display_name(viewer),
+                      disabled=True, key="export_who_fixed")
+        st.caption("Only managers can export other people's months.")
+
+    if st.button("Create export", type="primary", use_container_width=True,
+                 key="export_build"):
+        try:
+            with st.spinner("Updating the view and collecting entries..."):
+                ensure_monthly_view(export_month)
+                target = None if export_who == "all" else int(export_who)
+                rows = fetch_month(export_month, target)
+                who_label = ("all_employees" if export_who == "all"
+                             else name_slug(user_by_id[export_who]))
+                st.session_state.export_blob = (
+                    (export_month, export_who),        # what these bytes are for
+                    export_filename(export_month, who_label),
+                    build_workbook(rows, export_month.strftime("%b %Y")),
+                    len(rows),
+                )
+        except Exception as exc:
+            st.session_state.export_blob = None
+            st.error(f"Export failed: {exc}")
+
+    # Read AFTER the build button so the file is offered in the same run.
+    # A file built for other settings is stale the moment they change.
+    blob = st.session_state.get("export_blob")
+    if not blob or blob[0] != (export_month, export_who):
+        return
+    _, fname, data, count = blob
+    if not count:
+        st.info("No entries logged in that month - nothing to export.")
+        return
+    st.success(f"{count} entries ready.")
+    st.download_button(
+        f"Download {fname}", data=data, file_name=fname,
+        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        type="primary", use_container_width=True, key="export_download",
+    )
 
 # =====================================================
 # Grid model builders (pure functions -> unit-testable)
@@ -1163,6 +1258,13 @@ if auth:
             end_session(cookies)
             st.rerun()
 
+# Exporting spans months, so it belongs in the header strip rather than
+# anywhere in the week grid. Everything else happens in the dialog.
+if spacer_col.button("Export to Excel", key="open_export"):
+    export_dialog(viewer, viewer_id, can_manage, user_ids, user_by_id,
+                  date(st.session_state.week_start.year,
+                       st.session_state.week_start.month, 1))
+
 def go_to_week(new_start):
     st.session_state.week_start = new_start
     st.rerun()
@@ -1181,88 +1283,6 @@ if isinstance(picked_day, (list, tuple)):
     picked_day = picked_day[0] if picked_day else st.session_state.week_start
 if picked_day and monday_of(picked_day) != st.session_state.week_start:
     go_to_week(monday_of(picked_day))
-
-# =====================================================
-# Monthly Excel export
-# =====================================================
-
-# Scope 1 exports only their own month. Offering "all employees" to
-# everyone would hand out far more than the calendar itself ever shows
-# them, so the option only exists from MANAGE_SCOPE up.
-
-def month_options(around):
-    """The last 13 months, newest first, plus the month being viewed."""
-    today = date.today()
-    m = date(today.year, today.month, 1)
-    out = []
-    for _ in range(13):
-        out.append(m)
-        m = date(m.year - 1, 12, 1) if m.month == 1 else date(m.year, m.month - 1, 1)
-    if around not in out:
-        out.append(around)
-        out.sort(reverse=True)
-    return out
-
-
-def name_slug(user):
-    text = str(user_display_name(user)).lower()
-    return "".join(ch if ch.isalnum() else "_" for ch in text).strip("_") or "employee"
-
-
-with st.expander("Export a month to Excel"):
-    viewed_month = date(st.session_state.week_start.year,
-                        st.session_state.week_start.month, 1)
-    months = month_options(viewed_month)
-
-    m_col, who_col, go_col = st.columns([2, 2.6, 2])
-    export_month = m_col.selectbox(
-        "Month", months, index=months.index(viewed_month), key="export_month",
-        format_func=lambda d: d.strftime("%B %Y"),
-    )
-
-    if can_manage:
-        who_options = ["all"] + user_ids
-        export_who = who_col.selectbox(
-            "Employees", who_options, index=0, key="export_who",
-            format_func=lambda w: ("All employees" if w == "all"
-                                   else user_display_name(user_by_id[w])),
-        )
-    else:
-        export_who = viewer_id
-        who_col.text_input("Employees", value=user_display_name(viewer),
-                           disabled=True, key="export_who_fixed")
-
-    go_col.write("")     # nudge the button down onto the widgets' baseline
-    if go_col.button("Update view & export", key="do_export", use_container_width=True):
-        try:
-            with st.spinner("Updating the view and collecting entries..."):
-                ensure_monthly_view()
-                target = None if export_who == "all" else int(export_who)
-                rows = fetch_month(export_month, target)
-                who_label = ("all_employees" if export_who == "all"
-                             else name_slug(user_by_id[export_who]))
-                st.session_state.export_blob = (
-                    export_filename(export_month, who_label),
-                    build_workbook(rows, export_month.strftime("%b %Y")),
-                    len(rows),
-                )
-        except Exception as exc:
-            st.session_state.export_blob = None
-            st.error(f"Export failed: {exc}")
-
-    # Held in session state because download_button cannot be the same
-    # click that builds the file - the click above reruns the script.
-    blob = st.session_state.get("export_blob")
-    if blob:
-        fname, data, count = blob
-        if count:
-            st.download_button(
-                f"Download {fname} ({count} entries)", data=data, file_name=fname,
-                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                key="dl_export", use_container_width=True,
-            )
-        else:
-            st.info("No entries logged in that month - nothing to export.")
 
 # =====================================================
 # Data for the viewed user + permissions for this week
