@@ -1542,5 +1542,7 @@ if is_confirmed:
 elif wk_status == "submitted":
     st.caption("Week is submitted: the grid is read-only."
                + (" Use Unsubmit to make changes." if is_self else ""))
-else:
+elif not can_edit:
+    # Someone else's open week. An open week of your own needs no caption:
+    # it is editable, which the grid already shows by being clickable.
     st.caption("Read-only view of this calendar.")
