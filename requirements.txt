@@ -1,3 +1,4 @@
 requests
 peliqan
 streamlit
+openpyxl
