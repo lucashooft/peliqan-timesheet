@@ -103,6 +103,11 @@ from datetime import date, datetime, time, timedelta, timezone
 # NOTE: literal only - executed by the Peliqan runtime BEFORE the script body.
 st.set_page_config(page_title="My week", layout="wide")
 
+# Wide layout reserves ~6rem above the first element. This is a calendar:
+# the grid wants that vertical space more than the top of the page does.
+st.markdown("<style>.block-container{padding-top:2.2rem;}</style>",
+            unsafe_allow_html=True)
+
 # =====================================================
 # Config
 # =====================================================
@@ -1225,27 +1230,14 @@ if not users:
 user_by_id = {to_int(u.get("id")): u for u in users}
 user_ids = list(user_by_id.keys())
 
-if auth:
-    # Caption stacked directly on top of the button, both in one right-hand
-    # column. Positioned with columns rather than right-aligning HTML:
-    # auth["name"] is whatever the Google account is called, and that does
-    # not belong in a markdown sink.
-    # Narrow enough that the caption fills the column, so the full-width
-    # button below lands at the same width as the text above it. Widen if
-    # a longer name or address starts wrapping onto a second line.
-    _, acct_col = st.columns([7.6, 2.4])
-    with acct_col:
-        st.caption(f"Signed in as {auth['name']} ({auth['email']})")
-        if st.button("Sign out", key="sign_out", use_container_width=True):
-            end_session(cookies)
-            st.rerun()
-
-# One row of filters, bottom-aligned so the Export button sits on the same
-# baseline as the inputs beside it rather than level with their labels.
-# gap_col is deliberately left empty: it pushes Export to the far right,
-# away from the three filters it has nothing to do with.
-id_col, view_col, week_col, gap_col, export_col = st.columns(
-    [2.3, 2.3, 1.7, 1.7, 2.0], vertical_alignment="bottom")
+# One row for everything at the top, bottom-aligned so the buttons sit on
+# the same baseline as the inputs beside them rather than level with their
+# labels. Weights sum to 10.0 and export_col is 2.0, matching status_col in
+# the header row below so the two buttons render the same width.
+# gap_col is deliberately left empty, separating the filters from the
+# actions that have nothing to do with them.
+id_col, view_col, week_col, gap_col, export_col, acct_col = st.columns(
+    [2.2, 2.2, 1.6, 0.4, 2.0, 1.6], vertical_alignment="bottom")
 
 # The viewer is whoever logged in with Google. While IDENTIFY_BY_LOGIN is
 # False the "I am" selectbox stays available for testing, preselected on
@@ -1276,6 +1268,16 @@ else:
 
 viewing_user = user_by_id[viewing_id]
 is_self = viewing_id == viewer_id
+
+# The account collapses into a popover: a strip of its own above the
+# filters cost a whole row of height for two small things. The name is the
+# label, the address and Sign out live inside.
+if auth:
+    with acct_col.popover(auth["name"], use_container_width=True):
+        st.caption(auth["email"])
+        if st.button("Sign out", key="sign_out", use_container_width=True):
+            end_session(cookies)
+            st.rerun()
 
 # Exporting spans months, so it sits with the filters rather than anywhere
 # in the week grid. Managers only - scope 1 never sees the button.
@@ -1376,14 +1378,13 @@ with status_col:
         by = user_by_id.get(to_int((submission or {}).get("confirmed_by")))
         st.success("Week validated" + (f" by {user_display_name(by)}" if by else ""))
     elif wk_status == "submitted":
-        b1, b2 = st.columns([1.2, 1])
-        #b1.info("Submitted")
-        with b2:
-            if can_validate and st.button("Validate", key="validate_btn", type="primary", use_container_width=True):
-                validate_dialog(viewing_user, week_start, viewer_id, submission)
-            if can_unsubmit and st.button("Unsubmit", key="unsubmit_btn", use_container_width=True):
-                unsubmit_week(viewing_id, week_start)
-                st.rerun()
+        # No nested split: these fill status_col, so they come out the same
+        # width as "Submit week" in the other branch and as Export above.
+        if can_validate and st.button("Validate", key="validate_btn", type="primary", use_container_width=True):
+            validate_dialog(viewing_user, week_start, viewer_id, submission)
+        if can_unsubmit and st.button("Unsubmit", key="unsubmit_btn", use_container_width=True):
+            unsubmit_week(viewing_id, week_start)
+            st.rerun()
     else:
         if can_submit:
             if st.button("Submit week", key="submit_week_btn", type="primary", use_container_width=True):
