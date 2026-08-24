@@ -124,6 +124,9 @@ DAY_TARGET_MIN = 8 * 60      # minimum per workday
 WORKDAYS = (0, 1, 2, 3, 4)
 DAY_ABBREV = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]
 
+SLOT_MIN = 15                # add-target granularity, in minutes
+SLOTS_PER_H = 60 // SLOT_MIN
+
 GRID_START_H = 7             # default visible range; auto-extends to fit
 GRID_END_H = 19
 ROW_PX = 52                  # pixels per hour row
@@ -754,35 +757,44 @@ def build_grid_frames(week_df, days, lookup):
     return pd.DataFrame(rows), untimed, start_h, end_h
 
 
-def occupied_hours(bars_df):
-    """{day_index: {hour, ...}} for every hour cell an entry overlaps."""
+def occupied_slots(bars_df):
+    """
+    {day_index: {slot, ...}} for every slot an entry overlaps, where a slot
+    is SLOT_MIN minutes counted from midnight: slot 37 is 09:15.
+
+    Rounded outwards, so an entry from 09:20 to 09:50 occupies 09:15 and
+    09:30 - a partly covered slot is not offered as free.
+    """
     busy = {}
     if bars_df is None or bars_df.empty:
         return busy
     import math
     for r in bars_df.itertuples():
-        lo = int(math.floor(float(r.y0)))
-        hi = int(math.ceil(float(r.y1)))
+        lo = int(math.floor(float(r.y0) * SLOTS_PER_H))
+        hi = int(math.ceil(float(r.y1) * SLOTS_PER_H))
         busy.setdefault(int(r.day_i), set()).update(range(lo, max(hi, lo + 1)))
     return busy
 
 
 def build_cells_frame(days, start_h, end_h, bars_df=None):
-    """Click targets for ADDING an entry: only hours that are still free.
-    Hours covered by an existing entry are left out, so a click on a block
-    can never fall through to the add dialog and create an overlap."""
-    busy = occupied_hours(bars_df)
+    """Click targets for ADDING an entry: only the SLOT_MIN-minute blocks
+    that are still free. Slots covered by an existing entry are left out,
+    so a click on a block can never fall through to the add dialog and
+    create an overlap."""
+    busy = occupied_slots(bars_df)
     rows = []
     for i, d in enumerate(days):
         taken = busy.get(i, set())
-        for h in range(start_h, end_h):
-            if h in taken:
+        for slot in range(start_h * SLOTS_PER_H, end_h * SLOTS_PER_H):
+            if slot in taken:
                 continue
+            h, m = divmod(slot * SLOT_MIN, 60)
             rows.append({"day_i": i,
-                         "cell_day": d.isoformat(), "cell_hour": h,
-                         "y0": h,
-                         "hint": f"new entry at {h:02d}:00"})
-    return pd.DataFrame(rows, columns=["day_i", "cell_day", "cell_hour", "y0", "hint"])
+                         "cell_day": d.isoformat(), "cell_hour": h, "cell_min": m,
+                         "y0": slot / SLOTS_PER_H,
+                         "hint": f"new entry at {h:02d}:{m:02d}"})
+    return pd.DataFrame(rows, columns=["day_i", "cell_day", "cell_hour",
+                                       "cell_min", "y0", "hint"])
 
 
 def selected_customdata(event):
@@ -1345,7 +1357,10 @@ if pending:
             e = match.iloc[0].to_dict()
             entry_dialog(e, lookup, editable=can_edit and not is_true(e.get("approved")))
     elif kind == "add" and can_edit:
-        add_dialog(viewing_id, pending[1], lookup, default_start=time(pending[2], 0))
+        # len check: a pending queued before slots existed carries no minute
+        minute = pending[3] if len(pending) > 3 else 0
+        add_dialog(viewing_id, pending[1], lookup,
+                   default_start=time(pending[2], minute))
 
 # =====================================================
 # Header
@@ -1450,9 +1465,10 @@ if can_edit and not cells_df.empty:
         x=cells_df["day_i"],
         width=1.0,                         # exactly one day column
         base=cells_df["y0"],
-        y=[1] * len(cells_df),             # exactly one hour row
+        y=[1 / SLOTS_PER_H] * len(cells_df),   # exactly one SLOT_MIN block
         marker=dict(color="rgba(76,120,168,0.001)", line=dict(width=0)),
-        customdata=[["add", r.cell_day, int(r.cell_hour)] for r in cells_df.itertuples()],
+        customdata=[["add", r.cell_day, int(r.cell_hour), int(r.cell_min)]
+                    for r in cells_df.itertuples()],
         hovertext=cells_df["hint"],
         hovertemplate="%{hovertext}<extra></extra>",
         textposition="none",               # the hint is a tooltip, not a label
@@ -1543,10 +1559,12 @@ if cd:
         try:
             d = date.fromisoformat(str(cd[1]))
             h = int(cd[2])
+            m = int(cd[3])
         except (TypeError, ValueError, IndexError):
-            d, h = None, 9
+            d, h, m = None, 9, 0
         if d:
-            st.session_state.pending = ("add", d, max(0, min(23, h)))
+            st.session_state.pending = ("add", d, max(0, min(23, h)),
+                                        max(0, min(59, m)))
             st.session_state.cal_nonce += 1
             st.rerun()
 
