@@ -46,7 +46,8 @@ ts_prod.users.scope, cumulative):
   - Scope 1 (employee): sees only their OWN weekly calendar. Can add/edit/
     delete entries while the week is open, and Submit / Unsubmit it.
   - Scope 2+ (manager/admin): gets a second "Viewing" selectbox to open
-    anyone's calendar.
+    anyone's calendar, and the only "Export to Excel" button - scope 1
+    never sees it.
       - viewing their own week: Submit / Unsubmit, plus Validate once
         the week is submitted (managers may validate their own week).
       - viewing someone else's week: read-only; if that week is
@@ -604,7 +605,7 @@ def name_slug(user):
 
 
 @st.dialog("Export to Excel")
-def export_dialog(viewer, viewer_id, can_manage, user_ids, user_by_id, default_month):
+def export_dialog(can_manage, user_ids, user_by_id, default_month):
     """
     Pick a month and whose entries, build the file, then download it.
 
@@ -612,26 +613,26 @@ def export_dialog(viewer, viewer_id, can_manage, user_ids, user_by_id, default_m
     querying it, which is too slow to do on every keystroke, and
     st.download_button needs the bytes in hand before it can be drawn.
 
-    Scope 1 exports only their own month - offering "all employees" to
-    everyone would hand out far more than the calendar ever shows them.
+    Managers only. An export reaches across every employee and every week,
+    including weeks the viewer cannot open in the calendar, so the button
+    that opens this is itself behind can_manage - the check below is the
+    second lock, not the first.
     """
+    if not can_manage:
+        st.error("Exporting is limited to managers.")
+        return
+
     months = month_options(default_month)
     export_month = st.selectbox(
         "Month", months, index=months.index(default_month), key="export_month",
         format_func=lambda d: d.strftime("%B %Y"),
     )
 
-    if can_manage:
-        export_who = st.selectbox(
-            "Employees", ["all"] + user_ids, index=0, key="export_who",
-            format_func=lambda w: ("All employees" if w == "all"
-                                   else user_display_name(user_by_id[w])),
-        )
-    else:
-        export_who = viewer_id
-        st.text_input("Employees", value=user_display_name(viewer),
-                      disabled=True, key="export_who_fixed")
-        st.caption("Only managers can export other people's months.")
+    export_who = st.selectbox(
+        "Employees", ["all"] + user_ids, index=0, key="export_who",
+        format_func=lambda w: ("All employees" if w == "all"
+                               else user_display_name(user_by_id[w])),
+    )
 
     if st.button("Create export", type="primary", use_container_width=True,
                  key="export_build"):
@@ -1219,7 +1220,19 @@ if not users:
 user_by_id = {to_int(u.get("id")): u for u in users}
 user_ids = list(user_by_id.keys())
 
-id_col, view_col, week_col, spacer_col = st.columns([2.2, 2.2, 1.8, 3.8])
+if auth:
+    _, acct_col, out_col = st.columns([5.6, 3.0, 1.4], vertical_alignment="center")
+    acct_col.caption(f"Signed in as {auth['name']} ({auth['email']})")
+    if out_col.button("Sign out", key="sign_out", use_container_width=True):
+        end_session(cookies)
+        st.rerun()
+
+# One row of filters, bottom-aligned so the Export button sits on the same
+# baseline as the inputs beside it rather than level with their labels.
+# gap_col is deliberately left empty: it pushes Export to the far right,
+# away from the three filters it has nothing to do with.
+id_col, view_col, week_col, gap_col, export_col = st.columns(
+    [2.3, 2.3, 1.7, 1.7, 2.0], vertical_alignment="bottom")
 
 # The viewer is whoever logged in with Google. While IDENTIFY_BY_LOGIN is
 # False the "I am" selectbox stays available for testing, preselected on
@@ -1251,17 +1264,12 @@ else:
 viewing_user = user_by_id[viewing_id]
 is_self = viewing_id == viewer_id
 
-if auth:
-    with spacer_col:
-        st.caption(f"Signed in as {auth['name']} ({auth['email']})")
-        if st.button("Sign out", key="sign_out"):
-            end_session(cookies)
-            st.rerun()
-
-# Exporting spans months, so it belongs in the header strip rather than
-# anywhere in the week grid. Everything else happens in the dialog.
-if spacer_col.button("Export to Excel", key="open_export"):
-    export_dialog(viewer, viewer_id, can_manage, user_ids, user_by_id,
+# Exporting spans months, so it sits with the filters rather than anywhere
+# in the week grid. Managers only - scope 1 never sees the button.
+# Everything else happens in the dialog.
+if can_manage and export_col.button("Export to Excel", key="open_export",
+                                    use_container_width=True):
+    export_dialog(can_manage, user_ids, user_by_id,
                   date(st.session_state.week_start.year,
                        st.session_state.week_start.month, 1))
 
