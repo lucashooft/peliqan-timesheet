@@ -627,6 +627,17 @@ class LoginError(Exception):
     """Anything that must send the visitor back to the login page."""
 
 
+class StaleCodeError(LoginError):
+    """
+    The authorization code was already redeemed, or it expired.
+
+    Not a misconfiguration and not worth an error banner: the visitor
+    simply gets the sign-in page back. Google's redirect lands on the
+    top-level window (the login uses target="_top"), so ?code= lives on
+    in a URL this app cannot rewrite - every refresh replays it.
+    """
+
+
 def now_ts():
     # NOTE: `time` is datetime.time in this module, so no `import time`.
     return int(datetime.now(timezone.utc).timestamp())
@@ -717,6 +728,8 @@ def exchange_code(code):
             detail = json.loads(exc.read().decode("utf-8")).get("error", "")
         except Exception:
             pass
+        if detail == "invalid_grant":
+            raise StaleCodeError("This authorization code was already used or has expired.")
         raise LoginError(
             f"Google refused this login ({detail or exc.code}). Usually the "
             "redirect URI or the client secret does not match the Google Cloud client."
@@ -902,15 +915,27 @@ if GOOGLE_LOGIN_ENABLED:
         code = params.get("code")
         if not code:
             login_page()
+        # Spend a code once per session: a rerun must not resubmit it.
+        # Reset by a hard refresh, which starts a fresh session - the
+        # StaleCodeError branch below is what covers that case.
+        consumed = st.session_state.setdefault("consumed_codes", set())
+        if str(code) in consumed:
+            clear_login_params()
+            login_page()
+        consumed.add(str(code))
         try:
             state_rand = read_state(params.get("state"))
             identity = read_identity(exchange_code(code), nonce_for(state_rand))
+        except StaleCodeError:
+            clear_login_params()     # leftover ?code=, not a failed login
+            login_page()
         except LoginError as exc:
             st.session_state.login_message = str(exc)
             clear_login_params()
             login_page(str(exc))
-        # Session first, then drop ?code= from the URL: a reload must never
-        # replay a one-time authorization code.
+        # Session first, then drop ?code= from our own URL. That is all
+        # this app can reach: the copy on the top-level window survives,
+        # so a replay is caught by StaleCodeError rather than prevented.
         auth = store_session(cookies, identity["email"], identity["name"])
         clear_login_params()
         st.rerun()
@@ -1263,7 +1288,5 @@ if is_confirmed:
 elif wk_status == "submitted":
     st.caption("Week is submitted: the grid is read-only."
                + (" Use Unsubmit to make changes." if is_self else ""))
-elif can_edit:
-    st.caption("Click a free hour or a day's + button to add an entry - click a block to open it - block height = duration.")
 else:
     st.caption("Read-only view of this calendar.")
