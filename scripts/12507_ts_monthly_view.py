@@ -100,6 +100,7 @@ EXPORT_COLUMNS = [
     ("entry_day", "Date"),
     ("start_time", "Start"),
     ("duration_hours", "Hours"),
+    ("billable", "Billable"),
     ("client", "Client"),
     ("project", "Project"),
     ("task", "Task"),
@@ -130,6 +131,7 @@ SELECT
     CAST(t.date AS DATE)                      AS entry_day,
     COALESCE(t.duration, 0)                   AS duration_minutes,
     ROUND(COALESCE(t.duration, 0) / 60.0, 2)  AS duration_hours,
+    COALESCE(tk.billable, FALSE)              AS billable,
     COALESCE(c.name, '-')                     AS client,
     COALESCE(p.name, '-')                     AS project,
     COALESCE(tk.name, '-')                    AS task,
@@ -204,14 +206,15 @@ def build_workbook(df, sheet_title):
     for r, row in enumerate(df.to_dict("records") if not df.empty else [], start=2):
         for col, (key, _) in enumerate(EXPORT_COLUMNS, start=1):
             value = row.get(key)
-            if key == "approved":
+            if key in ("approved", "billable"):
                 value = "yes" if value in (True, "true", "True", 1, "1") else "no"
             elif key == "duration_hours":
                 value = float(value or 0)
             ws.cell(row=r, column=col, value=value)
 
     widths = {"employee": 22, "entry_day": 12, "start_time": 8, "duration_hours": 8,
-              "client": 20, "project": 24, "task": 28, "note": 50, "approved": 10}
+              "billable": 9, "client": 20, "project": 24, "task": 28, "note": 50,
+              "approved": 10}
     for col, (key, _) in enumerate(EXPORT_COLUMNS, start=1):
         ws.column_dimensions[get_column_letter(col)].width = widths.get(key, 16)
 

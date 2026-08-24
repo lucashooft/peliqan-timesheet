@@ -265,6 +265,7 @@ EXPORT_COLUMNS = [
     ("entry_day", "Date"),
     ("start_time", "Start"),
     ("duration_hours", "Hours"),
+    ("billable", "Billable"),
     ("client", "Client"),
     ("project", "Project"),
     ("task", "Task"),
@@ -295,6 +296,7 @@ SELECT
     CAST(t.date AS DATE)                      AS entry_day,
     COALESCE(t.duration, 0)                   AS duration_minutes,
     ROUND(COALESCE(t.duration, 0) / 60.0, 2)  AS duration_hours,
+    COALESCE(tk.billable, FALSE)              AS billable,
     COALESCE(c.name, '-')                     AS client,
     COALESCE(p.name, '-')                     AS project,
     COALESCE(tk.name, '-')                    AS task,
@@ -369,14 +371,15 @@ def build_workbook(df, sheet_title):
     for r, row in enumerate(df.to_dict("records") if not df.empty else [], start=2):
         for col, (key, _) in enumerate(EXPORT_COLUMNS, start=1):
             value = row.get(key)
-            if key == "approved":
+            if key in ("approved", "billable"):
                 value = "yes" if value in (True, "true", "True", 1, "1") else "no"
             elif key == "duration_hours":
                 value = float(value or 0)
             ws.cell(row=r, column=col, value=value)
 
     widths = {"employee": 22, "entry_day": 12, "start_time": 8, "duration_hours": 8,
-              "client": 20, "project": 24, "task": 28, "note": 50, "approved": 10}
+              "billable": 9, "client": 20, "project": 24, "task": 28, "note": 50,
+              "approved": 10}
     for col, (key, _) in enumerate(EXPORT_COLUMNS, start=1):
         ws.column_dimensions[get_column_letter(col)].width = widths.get(key, 16)
 
@@ -1221,11 +1224,16 @@ user_by_id = {to_int(u.get("id")): u for u in users}
 user_ids = list(user_by_id.keys())
 
 if auth:
-    _, acct_col, out_col = st.columns([5.6, 3.0, 1.4], vertical_alignment="center")
-    acct_col.caption(f"Signed in as {auth['name']} ({auth['email']})")
-    if out_col.button("Sign out", key="sign_out", use_container_width=True):
-        end_session(cookies)
-        st.rerun()
+    # Caption stacked directly on top of the button, both in one right-hand
+    # column. Positioned with columns rather than right-aligning HTML:
+    # auth["name"] is whatever the Google account is called, and that does
+    # not belong in a markdown sink.
+    _, acct_col = st.columns([6.8, 3.2])
+    with acct_col:
+        st.caption(f"Signed in as {auth['name']} ({auth['email']})")
+        if st.button("Sign out", key="sign_out", use_container_width=True):
+            end_session(cookies)
+            st.rerun()
 
 # One row of filters, bottom-aligned so the Export button sits on the same
 # baseline as the inputs beside it rather than level with their labels.
@@ -1336,7 +1344,10 @@ if pending:
 # Header
 # =====================================================
 
-prev_col, next_col, this_col, title_col, status_col = st.columns([1.15, 1.0, 1.0, 4.15, 2.2])
+# Weights sum to 10.0, matching the filter row above, and status_col is
+# 2.0 like its export_col - so "Submit week" renders exactly as wide as
+# "Export to Excel". title_col absorbs the difference.
+prev_col, next_col, this_col, title_col, status_col = st.columns([1.15, 1.0, 1.0, 4.85, 2.0])
 
 if prev_col.button("Previous week", key="prev_week", use_container_width=True):
     go_to_week(week_start - timedelta(days=7))
