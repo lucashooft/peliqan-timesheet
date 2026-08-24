@@ -111,6 +111,7 @@ DW_NAME = "dw_3202"
 S = "ts_prod"
 
 DEFAULT_USER_ID = 7          # "I am" fallback when the login has no id (Sander)
+FIRST_EXPORT_MONTH = date(2026, 7, 1)   # no usable timesheet data before this
 MANAGE_SCOPE = 2             # scope >= 2 can view anyone + validate
 SCOPE_LABELS = {1: "employee", 2: "manager", 3: "admin"}
 
@@ -588,18 +589,15 @@ def validate_dialog(target_user, week_start, validated_by_id, existing_submissio
         st.rerun()
 
 
-def month_options(around):
-    """The last 13 months, newest first, plus the month being viewed."""
+def month_options():
+    """Every exportable month, newest first: FIRST_EXPORT_MONTH to now."""
     today = date.today()
     m = date(today.year, today.month, 1)
     out = []
-    for _ in range(13):
+    while m >= FIRST_EXPORT_MONTH:
         out.append(m)
         m = date(m.year - 1, 12, 1) if m.month == 1 else date(m.year, m.month - 1, 1)
-    if around not in out:
-        out.append(around)
-        out.sort(reverse=True)
-    return out
+    return out or [FIRST_EXPORT_MONTH]
 
 
 def name_slug(user):
@@ -625,9 +623,13 @@ def export_dialog(can_manage, user_ids, user_by_id, default_month):
         st.error("Exporting is limited to managers.")
         return
 
-    months = month_options(default_month)
+    months = month_options()
+    # The week on screen can sit outside that range - navigate far enough
+    # back or forward - so fall back to the newest month rather than
+    # offering one the range does not contain.
+    default = default_month if default_month in months else months[0]
     export_month = st.selectbox(
-        "Month", months, index=months.index(default_month), key="export_month",
+        "Month", months, index=months.index(default), key="export_month",
         format_func=lambda d: d.strftime("%B %Y"),
     )
 
@@ -1228,7 +1230,10 @@ if auth:
     # column. Positioned with columns rather than right-aligning HTML:
     # auth["name"] is whatever the Google account is called, and that does
     # not belong in a markdown sink.
-    _, acct_col = st.columns([6.8, 3.2])
+    # Narrow enough that the caption fills the column, so the full-width
+    # button below lands at the same width as the text above it. Widen if
+    # a longer name or address starts wrapping onto a second line.
+    _, acct_col = st.columns([7.6, 2.4])
     with acct_col:
         st.caption(f"Signed in as {auth['name']} ({auth['email']})")
         if st.button("Sign out", key="sign_out", use_container_width=True):
