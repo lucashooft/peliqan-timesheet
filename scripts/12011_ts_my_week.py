@@ -717,6 +717,10 @@ def exchange_code(code):
             detail = json.loads(exc.read().decode("utf-8")).get("error", "")
         except Exception:
             pass
+        raise LoginError(
+            f"Google refused this login ({detail or exc.code}). Usually the "
+            "redirect URI or the client secret does not match the Google Cloud client."
+        )
     except Exception:
         raise LoginError("Could not reach Google to finish the login - please try again.")
 
