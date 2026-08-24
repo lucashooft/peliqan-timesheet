@@ -1,0 +1,4 @@
+[submodule ".claude"]
+	path = .claude
+	url = https://github.com/lucashooft/peliqan-agents-skills.git
+	branch = main
