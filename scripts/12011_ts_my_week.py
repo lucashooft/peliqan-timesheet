@@ -610,13 +610,13 @@ COOKIE_SESSION = "session"
 # once the secrets exist and the redirect URI is registered in Google.
 # WARNING: False means no access control at all - do not leave the app
 # published as "Public" in that state.
-GOOGLE_LOGIN_ENABLED = False
+GOOGLE_LOGIN_ENABLED = True
 
 # POC switch: False keeps the "I am" selectbox for testing (the logged-in
 # user is preselected). Flip to True once the login flow is verified -
 # the viewer is then always the logged-in user and the selectbox is gone.
 # Ignored while GOOGLE_LOGIN_ENABLED is False: there is no login to use.
-IDENTIFY_BY_LOGIN = False
+IDENTIFY_BY_LOGIN = True
 
 # Shows the redirect URI in use and which query parameters reached the
 # app - the two things that break first. Set to False once verified.
