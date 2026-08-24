@@ -1436,15 +1436,26 @@ cells_df = build_cells_frame(days, start_h, end_h, bars_df)
 
 fig = go.Figure()
 
-# invisible click targets for empty hour cells (behind the entry bars)
+# Invisible click targets for empty hour cells (behind the entry bars).
+#
+# Bars, not scatter markers. A marker is sized in pixels, so a 34px square
+# covered only the middle ~18% of a day column and ~65% of a row - while
+# Plotly's "closest" hover still turned the cursor into a pointer well
+# outside it. That is how you got a pointing finger over places with no
+# add target: no tooltip, and a click that selected nothing. A bar lives
+# in data coordinates, so width=1 and height=1 tile the cell exactly, at
+# any window size, and hover only fires inside it.
 if can_edit and not cells_df.empty:
-    fig.add_trace(go.Scatter(
-        x=cells_df["day_i"], y=cells_df["y0"] + 0.5,
-        mode="markers",
-        marker=dict(symbol="square", size=34, color="rgba(76,120,168,0.001)"),
+    fig.add_trace(go.Bar(
+        x=cells_df["day_i"],
+        width=1.0,                         # exactly one day column
+        base=cells_df["y0"],
+        y=[1] * len(cells_df),             # exactly one hour row
+        marker=dict(color="rgba(76,120,168,0.001)", line=dict(width=0)),
         customdata=[["add", r.cell_day, int(r.cell_hour)] for r in cells_df.itertuples()],
-        hovertemplate="%{text}<extra></extra>",
-        text=cells_df["hint"],
+        hovertext=cells_df["hint"],
+        hovertemplate="%{hovertext}<extra></extra>",
+        textposition="none",               # the hint is a tooltip, not a label
         showlegend=False,
         name="cells",
     ))
