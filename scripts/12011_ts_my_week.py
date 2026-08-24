@@ -620,7 +620,7 @@ IDENTIFY_BY_LOGIN = True
 
 # Shows the redirect URI in use and which query parameters reached the
 # app - the two things that break first. Set to False once verified.
-LOGIN_DEBUG = True
+LOGIN_DEBUG = False
 
 
 class LoginError(Exception):
