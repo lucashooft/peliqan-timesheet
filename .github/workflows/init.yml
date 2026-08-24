@@ -1,0 +1,34 @@
+name: Initialize template
+
+on:
+  push:
+    branches: [main]
+
+permissions:
+  contents: write
+
+jobs:
+  init:
+    runs-on: ubuntu-latest
+    if: github.event.repository.is_template == false
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Check if submodule already initialized
+        id: check
+        run: |
+          if git ls-tree HEAD -- .claude | grep -q "^160000"; then
+            echo "done=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "done=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Add content submodule and remove this workflow
+        if: steps.check.outputs.done == 'false'
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git submodule add -b main https://github.com/lucashooft/peliqan-agents-skills.git .claude
+          git rm .github/workflows/init.yml
+          git commit -m "Initialize skills submodule"
+          git push

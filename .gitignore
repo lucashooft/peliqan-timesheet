@@ -1,0 +1,22 @@
+# Local Python environment
+.venv/
+venv/
+__pycache__/
+*.pyc
+
+# Transient conflict artifacts written by fetch_peliqan_data_apps.py when a
+# local script has unpushed edits - not meant to be committed.
+scripts/*.remote.py
+
+# Regenerated summary output from fetch_peliqan_data_apps.py - not source
+# content, safe to regenerate any time by re-running the script.
+/data_apps.json
+/data_apps.csv
+
+# Per-machine Claude Code settings (already covered by most global gitignores,
+# listed here too so the rule holds for any clone).
+.claude/settings.local.json
+
+# OS cruft
+.DS_Store
+Thumbs.db
