@@ -109,6 +109,16 @@ DAY_TARGET_MIN = 8 * 60      # minimum per workday
 WORKDAYS = (0, 1, 2, 3, 4)
 DAY_ABBREV = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]
 
+# ts_mcp_server's TASK_STATUS, kept in step: a task created here must be
+# one the MCP would also accept.
+TASK_STATUSES = ["todo", "in_progress", "done", "blocked"]
+NEW_TASK_STATUS = "todo"
+NEW_TASK_BILLABLE = False
+
+# Project ids the viewer may create a task under, or None for "no
+# restriction". Set alongside TASK_CHOICES once the viewer is known.
+PROJECT_CHOICES = None
+
 SLOT_MIN = 15                # add-target granularity, in minutes
 SLOTS_PER_H = 60 // SLOT_MIN
 
@@ -192,6 +202,7 @@ def load_task_lookup():
     dbconn = pq.dbconnect(DW_NAME)
     rows = dbconn.fetch(DW_NAME, query=f"""
         SELECT t.id AS task_id, t.name AS task,
+               t.project_id, t.status, t.billable, t.description,
                COALESCE(p.name, '-') AS project,
                COALESCE(c.id, 0) AS client_id,
                COALESCE(c.name, '-') AS client
@@ -208,6 +219,10 @@ def load_task_lookup():
         lookup[tid] = {
             "task": r.get("task") or f"Task {tid}",
             "project": r.get("project") or "-",
+            "project_id": to_int(r.get("project_id")),
+            "status": r.get("status") or "-",
+            "billable": is_true(r.get("billable")),
+            "description": r.get("description") or "",
             "client": r.get("client") or "-",
             "client_id": cid,
             "color": CLIENT_COLORS[cid % len(CLIENT_COLORS)],
@@ -245,9 +260,46 @@ def load_client_links():
     return links
 
 
+@st.cache_data(ttl=300)
+def load_projects():
+    """{project_id: {name, client, client_id}} - targets for a new task."""
+    dbconn = pq.dbconnect(DW_NAME)
+    rows = dbconn.fetch(DW_NAME, query=f"""
+        SELECT p.id AS project_id, p.name AS project,
+               COALESCE(c.id, 0) AS client_id,
+               COALESCE(c.name, '-') AS client
+        FROM {S}.projects p
+        LEFT JOIN {S}.clients c ON c.id = p.client_id
+    """) or []
+    out = {}
+    for r in rows:
+        pid = to_int(r.get("project_id"))
+        if pid is None:
+            continue
+        out[pid] = {
+            "project": r.get("project") or f"Project {pid}",
+            "client": r.get("client") or "-",
+            "client_id": to_int(r.get("client_id")) or 0,
+        }
+    return out
+
+
 def allowed_task_ids(lookup, links, user_id):
     """The tasks `user_id` may log against: those of clients they are on."""
     return {tid for tid, info in lookup.items()
+            if to_int(user_id) in links.get(info["client_id"], set())}
+
+
+def allowed_project_ids(projects, links, user_id):
+    """
+    Projects `user_id` may create a task under.
+
+    Same client rule as allowed_task_ids, and for the same reason: a task
+    created under a client they are not on would immediately vanish from
+    their own task picker, since that is what TASK_CHOICES filters on.
+    Creating something you cannot then use is worse than not offering it.
+    """
+    return {pid for pid, info in projects.items()
             if to_int(user_id) in links.get(info["client_id"], set())}
 
 
@@ -268,6 +320,45 @@ def load_submissions(user_id):
 # =====================================================
 # Writes
 # =====================================================
+
+def create_task(name, project_id, status, billable, description):
+    """
+    Create a task and return (task_id, error).
+
+    dbconn.insert does not hand back the new row's id, so the task is read
+    back and matched on (project_id, name) - the same re-find ts_mcp_server
+    does in get_created_row, with the same failure case when it cannot be
+    found again. billable is passed as a real bool on purpose: dbconn puts
+    string values through Decimal(), so "false" would 400.
+    """
+    name = (name or "").strip()
+    dbconn = pq.dbconnect(DW_NAME)
+    dbconn.insert(DW_NAME, S, "tasks", {
+        "name": name,
+        "project_id": int(project_id),
+        "status": status,
+        "billable": bool(billable),
+        "description": (description or "").strip(),
+    })
+    load_task_lookup.clear()
+    for tid, info in load_task_lookup().items():
+        if (info.get("project_id") == int(project_id)
+                and str(info.get("task") or "").strip().lower() == name.lower()):
+            return tid, None
+    return None, ("The task was created but could not be found again. "
+                  "Open the entry dialog once more and pick it from the list.")
+
+
+def duplicate_task(lookup, project_id, name):
+    """ts_prod.tasks is unique on (project_id, name) - mirror that here so
+    the picker never shows two identical entries under one project."""
+    name = (name or "").strip().lower()
+    if not name:
+        return False
+    return any(info.get("project_id") == int(project_id)
+               and str(info.get("task") or "").strip().lower() == name
+               for info in lookup.values())
+
 
 def insert_entry(user_id, task_id, entry_dt, duration_minutes, note):
     dbconn = pq.dbconnect(DW_NAME)
@@ -395,18 +486,86 @@ def task_selectbox(lookup, key, current=None):
                         format_func=lambda i: f"{lookup[i]['client']} - {lookup[i]['task']}")
 
 
+def existing_task_fields(info):
+    """The picked task's own fields, shown but not editable. Editing one
+    would change it for everyone logging against it and relabel every
+    historical entry, so this is context only - ts_mcp_server exposes no
+    task-update tool either."""
+    c1, c2 = st.columns([2, 1])
+    c1.text_input("Project", value=f"{info['client']} - {info['project']}",
+                  disabled=True, key="add_ro_project")
+    c2.text_input("Status", value=info["status"], disabled=True, key="add_ro_status")
+    st.checkbox("Billable", value=info["billable"], disabled=True, key="add_ro_billable")
+    st.text_area("Description", value=info["description"] or "—",
+                 disabled=True, height=68, key="add_ro_desc")
+
+
+def new_task_fields(projects):
+    """Blank task form. Returns the entered values, project_id None until
+    one is chosen - Save stays disabled while that or the name is empty."""
+    ids = sorted(projects, key=lambda i: (projects[i]["client"], projects[i]["project"]))
+    if PROJECT_CHOICES is not None:
+        ids = [i for i in ids if i in PROJECT_CHOICES]
+    if not ids:
+        st.info("There is no project you can add a task to yet. Ask an "
+                "administrator to assign you to a client.")
+        return None
+
+    c1, c2 = st.columns([2, 1])
+    project_id = c1.selectbox(
+        "Project", ids, index=None, key="add_new_project",
+        placeholder="Choose a project...",
+        format_func=lambda i: f"{projects[i]['client']} - {projects[i]['project']}")
+    status = c2.selectbox("Status", TASK_STATUSES,
+                          index=TASK_STATUSES.index(NEW_TASK_STATUS),
+                          key="add_new_status")
+    name = st.text_input("Task name", key="add_new_name",
+                         placeholder="What is this task called?")
+    billable = st.checkbox("Billable", value=NEW_TASK_BILLABLE, key="add_new_billable")
+    description = st.text_area("Description", key="add_new_desc", height=68,
+                               placeholder="Optional")
+    return {"project_id": project_id, "status": status, "name": name,
+            "billable": billable, "description": description}
+
+
 @st.dialog("New entry")
 def add_dialog(user_id, day, lookup, default_start=time(9, 0)):
     st.caption(day.strftime("%A %d %B %Y"))
     task_id = task_selectbox(lookup, "add_task")
+
+    # Picked a task: show what it is. Picked nothing: offer to create one.
+    new_task = None
+    if task_id is not None:
+        existing_task_fields(lookup[task_id])
+    else:
+        st.caption("No task picked — fill these in to create a new one.")
+        new_task = new_task_fields(load_projects())
+
+    st.divider()
     c1, c2 = st.columns(2)
     start = c1.time_input("Start", value=default_start, step=timedelta(minutes=15), key="add_start")
     dur = c2.number_input("Duration (min)", min_value=5, step=15, value=60, key="add_dur")
     note = st.text_area("Note", key="add_note", height=80)
-    if st.button("Save", type="primary", use_container_width=True, key="add_save",
-                 disabled=task_id is None):
-        insert_entry(user_id, task_id, datetime.combine(day, start), dur, note)
-        st.rerun()
+
+    ready = task_id is not None or bool(
+        new_task and new_task["project_id"] is not None and new_task["name"].strip())
+    label = "Save" if task_id is not None else "Create task and save"
+    if st.button(label, type="primary", use_container_width=True, key="add_save",
+                 disabled=not ready):
+        error = None
+        if task_id is None:
+            if duplicate_task(lookup, new_task["project_id"], new_task["name"]):
+                error = ("That project already has a task with this name. "
+                         "Pick it from the list above instead.")
+            else:
+                task_id, error = create_task(
+                    new_task["name"], new_task["project_id"], new_task["status"],
+                    new_task["billable"], new_task["description"])
+        if error:
+            st.error(error)
+        else:
+            insert_entry(user_id, task_id, datetime.combine(day, start), dur, note)
+            st.rerun()
 
 
 @st.dialog("Entry")
@@ -1061,6 +1220,10 @@ lookup = load_task_lookup()
 # is whose entry would be written - though only they can write it.
 TASK_CHOICES = None if can_manage else allowed_task_ids(
     lookup, load_client_links(), viewing_id)
+# Creating a task is open to every scope, but the project list follows the
+# same client rule as the task list - see allowed_project_ids.
+PROJECT_CHOICES = None if can_manage else allowed_project_ids(
+    load_projects(), load_client_links(), viewing_id)
 submissions = load_submissions(viewing_id)
 
 week_start = st.session_state.week_start
