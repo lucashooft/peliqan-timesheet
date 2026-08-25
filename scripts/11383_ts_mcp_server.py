@@ -214,6 +214,19 @@ Changes from v3.16:
     deliberately out of scope.
   - Changelog entries above are left as they were written: they record what
     was true at the time, including the old tool name.
+
+Changes from v3.17:
+  - validate_entry is REMOVED, not renamed again: validating is not a
+    per-entry action. ts_my_week validates a whole WEEK at once - every
+    entry in it gets approved=true + approved_by and the submission row
+    becomes 'confirmed', in one operation - so a per-entry tool let an
+    agent leave a week half-validated: some entries locked while the
+    submission still reads 'submitted'. Nothing in the model repairs that.
+    Validation is now UI-only, a deliberate click in the grid rather than
+    something an agent does on a manager's behalf. A manager acting
+    through the MCP reads (run_report_query) and nothing else: after this
+    there is NO write path to ts_prod.timetable.approved here, at any
+    scope. 21 tools.
 """
 
 import json
@@ -507,6 +520,9 @@ def _check_project_dates(converted):
 # manager who needs to fix a submitted week unsubmits it first. A
 # validated week cannot be reopened at all - validating also sets
 # approved=true on every entry, which the validation checks already refuse.
+#
+# Validating itself is not reachable from here at all: it is a whole-week
+# action owned by ts_my_week. See the v3.17 note in the header.
 
 SUBMISSIONS_TABLE = "timetable_submissions"
 LOCKED_WEEK_STATUSES = {"submitted": "submitted for validation",
@@ -1371,36 +1387,6 @@ def create_user_role(name: str) -> dict:
 ###########################################################################
 ############################# MCP TOOLS: ADMIN #############################
 ###########################################################################
-
-@tool(min_scope=2)
-def validate_entry(entry_id: int) -> dict:
-    """
-    Validate a time entry, locking it: records that it is validated and who
-    validated it. A validated entry can no longer be edited or deleted by
-    anyone, whatever their scope.
-    :param entry_id: id of the timetable row being validated
-    """
-    if not validate_positive_int(entry_id):
-        return {"success": False, "error": "entry_id must be a positive integer."}
-    entry_id = int(entry_id)
-
-    entry = find_by_id(fetch_cached("ts_prod", "timetable"), entry_id)
-    if entry is None:
-        return {"success": False, "error": "No entry found with this id."}
-    if entry.get("approved"):
-        return {"success": False, "error": "This entry has already been validated."}
-
-    dbconn.update(DW_NAME, "ts_prod", "timetable", entry_id, {
-        "approved": True,
-        "approved_by": CURRENT_USER["user_id"],
-    })
-    _invalidate_timetable_caches()
-
-    updated_entry = find_by_id(fetch_cached("ts_prod", "timetable"), entry_id)
-    if not updated_entry:
-        return {"success": False, "error": "Entry updated but could not be found again."}
-    return {"success": True, "data": updated_entry}
-
 
 _BLOCKED_SQL_KEYWORDS = re.compile(r"\b(insert|update|delete|drop|alter|grant|truncate|create)\b", re.IGNORECASE)
 
