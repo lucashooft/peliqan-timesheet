@@ -321,9 +321,14 @@ def validate_week(user_id, week_start, validated_by_id, existing_submission):
 # =====================================================
 
 def task_selectbox(lookup, key, current=None):
+    """Task picker. Nothing preselected unless `current` names a live task -
+    a new entry shows the placeholder, so the first task in the list is
+    never saved just because nobody touched the box. Returns None while
+    the placeholder is showing; callers gate their Save on that."""
     ids = sorted(lookup, key=lambda i: (lookup[i]["client"], lookup[i]["project"], lookup[i]["task"]))
-    index = ids.index(current) if current in ids else 0
+    index = ids.index(current) if current in ids else None
     return st.selectbox("Task", ids, index=index, key=key,
+                        placeholder="Choose a task...",
                         format_func=lambda i: f"{lookup[i]['client']} - {lookup[i]['task']}")
 
 
@@ -335,7 +340,8 @@ def add_dialog(user_id, day, lookup, default_start=time(9, 0)):
     start = c1.time_input("Start", value=default_start, step=timedelta(minutes=15), key="add_start")
     dur = c2.number_input("Duration (min)", min_value=5, step=15, value=60, key="add_dur")
     note = st.text_area("Note", key="add_note", height=80)
-    if st.button("Save", type="primary", use_container_width=True, key="add_save"):
+    if st.button("Save", type="primary", use_container_width=True, key="add_save",
+                 disabled=task_id is None):
         insert_entry(user_id, task_id, datetime.combine(day, start), dur, note)
         st.rerun()
 
@@ -369,7 +375,8 @@ def entry_dialog(entry, lookup, editable):
         new_note = st.text_area("Note", value=entry.get("internal_description") or "",
                                 key="edit_note", height=80)
         s1, s2 = st.columns(2)
-        if s1.form_submit_button("Save", type="primary", use_container_width=True):
+        if s1.form_submit_button("Save", type="primary", use_container_width=True,
+                                 disabled=task_id is None):
             update_entry(entry["id"], task_id, datetime.combine(new_day, new_start), new_dur, new_note)
             st.rerun()
         if s2.form_submit_button("Delete", use_container_width=True):
