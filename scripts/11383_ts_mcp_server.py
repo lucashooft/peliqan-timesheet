@@ -192,8 +192,11 @@ Changes from v3.15:
     rule now matches ts_my_week exactly, whose grid has always been
     read-only on another user's calendar regardless of week status: a
     manager reviews a timesheet by validating it, not by rewriting it.
-    Reads are untouched - managers still see everyone's entries - and so
-    is approve_entry, which is how a manager acts on someone else's week.
+    Reads are untouched, and so is approve_entry - which, together with
+    run_report_query, is how a manager acts on someone else's week.
+    (get_my_time_entries / get_date_time_entries have always returned only
+    the caller's own rows, at every scope; cross-user reading goes through
+    run_report_query.)
     ts_weekly_calendar, the one surface that let managers edit other
     people's entries, has been deleted.
 """
@@ -481,9 +484,9 @@ def _check_project_dates(converted):
 # Submitting a week freezes it. timetable_submissions holds one row per
 # (user, week); while its status is 'submitted' or 'confirmed' no entry
 # in that week may be added, changed, moved or deleted - the same lock
-# ts_my_week / ts_weekly_calendar apply to their grids. Without this the
-# MCP was a way around those grids: an agent could still log, edit or
-# delete inside a week the user had already handed in.
+# ts_my_week applies to its grid. Without this the MCP was a way around
+# that grid: an agent could still log, edit or delete inside a week the
+# user had already handed in.
 #
 # Absolute, like the per-entry approved lock: it binds every scope, so a
 # manager who needs to fix a submitted week unsubmits it first. A

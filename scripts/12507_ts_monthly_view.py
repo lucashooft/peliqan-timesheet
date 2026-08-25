@@ -47,9 +47,10 @@ dashboard, wrong for an export somebody is about to send to a client.
 Because this is a plain view, it needs no refresh to be current: the
 scheduled run only matters when the SQL itself changes.
 
-ts_my_week (12011) calls the same ensure_monthly_view() before building
-its Excel file, so an export is never blocked on this script having run.
-Keep the SHARED BLOCK below byte-identical between the two apps.
+This is the only app that exports. ts_my_week (12011) used to carry a
+byte-identical copy of the block below and call ensure_monthly_view()
+itself; that copy has been removed, so there is nothing left to keep in
+sync - edit the block here and nowhere else.
 """
 
 import io
@@ -75,11 +76,10 @@ def say(message):
 
 
 # =====================================================
-# Monthly export view  (SHARED BLOCK - keep byte-identical with
-# ts_monthly_view / 12507_ts_monthly_view.py)
+# Monthly export view
 #
-# Two Data Apps cannot import each other, so this block is duplicated.
-# Edit it in one place and copy it to the other.
+# Was duplicated into ts_my_week (12011), since two Data Apps cannot
+# import each other. That copy is gone: this is the only one left.
 #
 # One view per calendar month: ts_reporting.v_monthly_entries_2026_08 and
 # so on. The month window is baked into each view's SQL, so reading one
@@ -87,9 +87,8 @@ def say(message):
 #
 # Sourced from the live ts_prod tables on purpose, NOT from
 # ts_reporting.fact_timetable: that one is a materialized query table and
-# does not reflect writes until its underlying query is re-run (see the
-# note in ts_weekly_calendar's load_timetable_approval_map). A plain view
-# over ts_prod is always current, which is what an export needs.
+# does not reflect writes until its underlying query is re-run. A plain
+# view over ts_prod is always current, which is what an export needs.
 # =====================================================
 
 VIEW_SCHEMA = "ts_reporting"

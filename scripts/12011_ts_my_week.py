@@ -23,7 +23,7 @@ for 12 hours. The logged-in user IS the viewer.
 Monthly Excel export lives in its own Data App (ts_monthly_view), not
 here.
 
-Who-sees-what (mirrors ts_weekly_calendar / ts_mcp_server's scope model,
+Who-sees-what (the same scope model ts_mcp_server enforces, keyed on
 ts_prod.users.scope, cumulative):
   - Scope 1 (employee): sees only their OWN weekly calendar. Can add/edit/
     delete entries while the week is open, and Submit / Unsubmit it.
@@ -33,10 +33,11 @@ ts_prod.users.scope, cumulative):
         the week is submitted (managers may validate their own week).
       - viewing someone else's week: read-only; if that week is
         submitted, a Validate button appears.
-  - Validate follows ts_weekly_calendar's confirm contract exactly:
+  - Validate is the terminal step, defined by validate_week() below:
     every timetable entry of that user in that week gets approved=true +
     approved_by, and the submission row becomes status='confirmed' with
-    confirmed_by / confirmed_at. Approved entries are locked for everyone.
+    confirmed_by / confirmed_at. Approved entries are then locked for
+    everyone, here and in ts_mcp_server, which refuses to write to them.
 
 Navigation: a date picker ("Show week of") jumps to the week containing
 any date, with explicit "Previous week" / "Next week" buttons next to it
@@ -282,9 +283,14 @@ def unsubmit_week(user_id, week_start):
 
 
 def validate_week(user_id, week_start, validated_by_id, existing_submission):
-    """Same contract as ts_weekly_calendar's confirm_week: approve every
-    timetable entry of the user in that week, then mark the submission
-    'confirmed'. Approved entries are locked for everyone afterwards."""
+    """Validate a week. This function IS the contract the other surfaces
+    read back, so both halves matter: every timetable entry of the user in
+    that week gets approved=true + approved_by, and the submission row
+    becomes status='confirmed'. ts_mcp_server refuses writes on approved
+    entries AND on a confirmed week; this app's grid goes read-only on
+    either. Entries are approved before the submission is confirmed, so a
+    failure part-way leaves the week merely submitted - still locked, and
+    safe to retry, since re-approving an approved entry is a no-op."""
     dbconn = pq.dbconnect(DW_NAME)
     key = submission_key(user_id, week_start)
     week_end = week_start + timedelta(days=6)
