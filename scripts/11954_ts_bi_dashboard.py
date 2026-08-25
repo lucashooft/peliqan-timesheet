@@ -27,11 +27,11 @@ Data sources:
   - ts_reporting.fact_timetable      : read-only, already joins timetable
                                         entries with tasks, projects, clients
                                         and users.
-  - ts_prod.timetable_submissions    : weekly submit -> approve workflow per
+  - ts_prod.timetable_submissions    : weekly submit -> validate workflow per
                                         user. Joined here on user_id + the
                                         Monday of the entry's week, so every
                                         logged hour can be classified as
-                                        Draft / Submitted / Approved.
+                                        Draft / Submitted / Validated.
 
 This app is read-only - it never writes to ts_prod.timetable or
 ts_prod.timetable_submissions, it only reports on them.
@@ -55,7 +55,7 @@ st.markdown(
 STATUS_LABELS = {
     None: "Draft",
     "submitted": "Submitted",
-    "confirmed": "Approved",
+    "confirmed": "Validated",
 }
 
 # =====================================================
@@ -123,7 +123,7 @@ df["user_name"] = df["user_name"].fillna("(unknown employee)")
 # =====================================================
 
 st.title("Project BI Dashboard")
-st.caption("Hours, billability and approval status across all projects, based on logged timesheet entries.")
+st.caption("Hours, billability and validation status across all projects, based on logged timesheet entries.")
 
 with st.sidebar:
     st.header("Filters")
@@ -143,8 +143,8 @@ with st.sidebar:
     statuses = sorted(df["project_status"].dropna().unique().tolist())
     selected_statuses = st.multiselect("Project status", statuses, default=statuses)
 
-    approval_options = ["Draft", "Submitted", "Approved"]
-    selected_approval = st.multiselect("Approval status", approval_options, default=approval_options)
+    validation_options = ["Draft", "Submitted", "Validated"]
+    selected_validation = st.multiselect("Validation status", validation_options, default=validation_options)
 
 if isinstance(date_range, tuple) and len(date_range) == 2:
     start_date, end_date = date_range
@@ -155,7 +155,7 @@ mask = (
     (df["entry_date"].dt.date >= start_date)
     & (df["entry_date"].dt.date <= end_date)
     & (df["client_name"].isin(selected_clients))
-    & (df["status_label"].isin(selected_approval))
+    & (df["status_label"].isin(selected_validation))
 )
 if selected_statuses:
     mask &= df["project_status"].isin(selected_statuses)
@@ -172,14 +172,14 @@ if fdf.empty:
 
 total_hours = fdf["hours"].sum()
 billable_hours = fdf.loc[fdf["billable"] == True, "hours"].sum()
-approved_hours = fdf.loc[fdf["status_label"] == "Approved", "hours"].sum()
+validated_hours = fdf.loc[fdf["status_label"] == "Validated", "hours"].sum()
 active_projects = fdf["project_name"].nunique()
 active_clients = fdf["client_name"].nunique()
 
 k1, k2, k3, k4, k5 = st.columns(5)
 k1.metric("Total hours", f"{total_hours:,.1f}")
 k2.metric("Billable hours", f"{billable_hours:,.1f}", f"{(billable_hours / total_hours * 100):.0f}% of total" if total_hours else None)
-k3.metric("Approved hours", f"{approved_hours:,.1f}", f"{(approved_hours / total_hours * 100):.0f}% of total" if total_hours else None)
+k3.metric("Validated hours", f"{validated_hours:,.1f}", f"{(validated_hours / total_hours * 100):.0f}% of total" if total_hours else None)
 k4.metric("Active projects", active_projects)
 k5.metric("Active clients", active_clients)
 
@@ -201,20 +201,20 @@ project_summary = (
     )
     .reset_index()
 )
-for col in approval_options:
+for col in validation_options:
     if col not in project_summary.columns:
         project_summary[col] = 0.0
 
 billable_by_project = fdf.groupby("project_name")["hours"].apply(lambda s: s[fdf.loc[s.index, "billable"] == True].sum())
 users_by_project = fdf.groupby("project_name")["user_name"].nunique()
 
-project_summary["Total hours"] = project_summary[approval_options].sum(axis=1)
+project_summary["Total hours"] = project_summary[validation_options].sum(axis=1)
 project_summary["Billable hours"] = project_summary["project_name"].map(billable_by_project).fillna(0)
 project_summary["Distinct users"] = project_summary["project_name"].map(users_by_project).fillna(0).astype(int)
 project_summary = project_summary.sort_values("Total hours", ascending=False)
 
 display_cols = ["project_name", "client_name", "project_status", "project_end_date",
-                 "Total hours", "Billable hours", "Draft", "Submitted", "Approved", "Distinct users"]
+                 "Total hours", "Billable hours", "Draft", "Submitted", "Validated", "Distinct users"]
 st.dataframe(
     project_summary[display_cols].round(1),
     use_container_width=True,
@@ -230,10 +230,10 @@ st.dataframe(
 st.divider()
 
 # =====================================================
-# Projects nearing / past their end date with unapproved hours
+# Projects nearing / past their end date with unvalidated hours
 # =====================================================
 
-st.subheader("Attention needed: projects past end date with unapproved hours")
+st.subheader("Attention needed: projects past end date with unvalidated hours")
 today = pd.Timestamp(date.today())
 project_summary["project_end_date"] = pd.to_datetime(project_summary["project_end_date"], errors="coerce")
 flagged = project_summary[
@@ -242,10 +242,10 @@ flagged = project_summary[
     & ((project_summary["Draft"] + project_summary["Submitted"]) > 0)
 ]
 if flagged.empty:
-    st.success("No overdue projects with unapproved hours.")
+    st.success("No overdue projects with unvalidated hours.")
 else:
     st.dataframe(
-        flagged[["project_name", "client_name", "project_end_date", "Draft", "Submitted", "Approved"]].round(1),
+        flagged[["project_name", "client_name", "project_end_date", "Draft", "Submitted", "Validated"]].round(1),
         use_container_width=True,
         hide_index=True,
     )

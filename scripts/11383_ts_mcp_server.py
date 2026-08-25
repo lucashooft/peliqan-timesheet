@@ -199,6 +199,21 @@ Changes from v3.15:
     run_report_query.)
     ts_weekly_calendar, the one surface that let managers edit other
     people's entries, has been deleted.
+
+Changes from v3.16:
+  - Vocabulary: everything a caller reads now says "validated" rather than
+    "approved", matching the wording ts_my_week has always used on its
+    Validate button. approve_entry is renamed validate_entry with NO alias,
+    so a client calling the old name gets an unknown-tool error - re-fetch
+    tools/list after deploying. Error messages and docstrings follow.
+  - The DATABASE keeps its names: ts_prod.timetable.approved and
+    approved_by are untouched, as is timetable_submissions.status =
+    'confirmed'. Renaming those would mean re-writing the SQL of the
+    ts_reporting.fact_timetable query table, which lives in Peliqan rather
+    than in this repo and is read by ts_bi_dashboard and ts_8h_alerter -
+    deliberately out of scope.
+  - Changelog entries above are left as they were written: they record what
+    was true at the time, including the old tool name.
 """
 
 import json
@@ -488,13 +503,13 @@ def _check_project_dates(converted):
 # that grid: an agent could still log, edit or delete inside a week the
 # user had already handed in.
 #
-# Absolute, like the per-entry approved lock: it binds every scope, so a
+# Absolute, like the per-entry validation lock: it binds every scope, so a
 # manager who needs to fix a submitted week unsubmits it first. A
 # validated week cannot be reopened at all - validating also sets
-# approved=true on every entry, which the approved checks already refuse.
+# approved=true on every entry, which the validation checks already refuse.
 
 SUBMISSIONS_TABLE = "timetable_submissions"
-LOCKED_WEEK_STATUSES = {"submitted": "submitted for approval",
+LOCKED_WEEK_STATUSES = {"submitted": "submitted for validation",
                         "confirmed": "validated"}
 
 
@@ -1103,10 +1118,10 @@ def update_time_entry(
 ) -> dict:
     """
     Update a time entry. You can only update your OWN entries, whatever
-    your scope - a manager reviewing someone else's timesheet approves or
+    your scope - a manager reviewing someone else's timesheet validates or
     rejects it, they do not rewrite it (same ownership rule as
-    delete_entry). Only fields you provide are changed; entries that are already
-    approved can no longer be edited, regardless of scope. The same goes
+    delete_entry). Only fields you provide are changed; an entry that has
+    already been validated can no longer be edited, regardless of scope. The same goes
     for any entry in a submitted or validated week, and a new date may not
     move an entry into such a week - unsubmit it first.
     :param entry_id: id of the timetable row to update
@@ -1126,7 +1141,7 @@ def update_time_entry(
     if str(entry.get("user_id")) != str(CURRENT_USER.get("user_id")):
         return {"success": False, "error": "You can only update your own entries."}
     if entry.get("approved"):
-        return {"success": False, "error": "This entry is already approved and can no longer be updated."}
+        return {"success": False, "error": "This entry has already been validated and can no longer be updated."}
     lock_error = _week_lock_error(entry.get("user_id"), entry.get("date"),
                                  "this entry can no longer be changed")
     if lock_error:
@@ -1180,8 +1195,8 @@ def update_time_entry(
 def delete_entry(entry_id: int) -> dict:
     """
     Delete a time entry. You can only delete your OWN entries, whatever
-    your scope - same ownership rule as update_time_entry. An entry that
-    is already approved cannot be deleted by anyone, regardless of scope - same rule as
+    your scope - same ownership rule as update_time_entry. A validated
+    entry cannot be deleted by anyone, regardless of scope - same rule as
     update_time_entry. Nor can an entry in a submitted or validated week,
     which is locked until that week is unsubmitted.
     :param entry_id: id of the timetable row to delete
@@ -1198,7 +1213,7 @@ def delete_entry(entry_id: int) -> dict:
         return {"success": False, "error": "You can only delete your own entries."}
 
     if entry.get("approved"):
-        return {"success": False, "error": "This entry is already approved and can no longer be deleted."}
+        return {"success": False, "error": "This entry has already been validated and can no longer be deleted."}
 
     lock_error = _week_lock_error(entry.get("user_id"), entry.get("date"),
                                  "this entry can no longer be deleted")
@@ -1358,11 +1373,12 @@ def create_user_role(name: str) -> dict:
 ###########################################################################
 
 @tool(min_scope=2)
-def approve_entry(entry_id: int) -> dict:
+def validate_entry(entry_id: int) -> dict:
     """
-    Approve a time entry: sets 'approved' to true and records who approved
-    it (approved_by = user_id of the approving manager/admin).
-    :param entry_id: id of the timetable row being approved
+    Validate a time entry, locking it: records that it is validated and who
+    validated it. A validated entry can no longer be edited or deleted by
+    anyone, whatever their scope.
+    :param entry_id: id of the timetable row being validated
     """
     if not validate_positive_int(entry_id):
         return {"success": False, "error": "entry_id must be a positive integer."}
@@ -1372,7 +1388,7 @@ def approve_entry(entry_id: int) -> dict:
     if entry is None:
         return {"success": False, "error": "No entry found with this id."}
     if entry.get("approved"):
-        return {"success": False, "error": "This entry is already approved."}
+        return {"success": False, "error": "This entry has already been validated."}
 
     dbconn.update(DW_NAME, "ts_prod", "timetable", entry_id, {
         "approved": True,

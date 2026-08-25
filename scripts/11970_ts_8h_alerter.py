@@ -24,12 +24,12 @@ Timesheet daily-shortfall alert ("ts_8h_alerter")
 Tracks every weekday, from FIXED_START_DATE onward, where a monitored user
 logged less than DAILY_THRESHOLD_MINUTES (default: 8h = 480 min) in
 ts_reporting.fact_timetable - UNLESS every entry logged that day is already
-approved (approved = true for all of that day's entries), in which case it's
+validated (the approved column is true for all of that day's entries), in which case it's
 treated as signed off and skipped.
 
 Two notifications per run:
 1. Each employee with outstanding shortfall days gets a Slack DM listing
-   every one of their non-8h, not-fully-approved days since FIXED_START_DATE.
+   every one of their non-8h, not-fully-validated days since FIXED_START_DATE.
 2. If run on a Monday, every "team lead" (ts_prod.users.scope == TEAM_LEAD_SCOPE)
    additionally gets a Slack DM with the full team-wide overview.
 
@@ -170,7 +170,7 @@ else:
     else:
         # -----------------------------------------------------------------
         # Query timesheet data for the whole window, grouped per user PER
-        # DAY, plus whether every entry that day is approved.
+        # DAY, plus whether every entry that day is validated.
         # -----------------------------------------------------------------
 
         user_list_sql = ", ".join("'" + u.replace("'", "''") + "'" for u in USER_LIST)
@@ -180,7 +180,7 @@ else:
             user_name,
             CAST(entry_date AS DATE) AS entry_day,
             COALESCE(SUM(duration), 0) AS total_minutes,
-            BOOL_AND(approved) AS all_approved
+            BOOL_AND(approved) AS all_validated
         FROM ts_reporting.fact_timetable
         WHERE entry_date >= TIMESTAMP '{window_start_str} 00:00:00'
           AND entry_date < TIMESTAMP '{window_end_exclusive_str} 00:00:00'
@@ -190,7 +190,7 @@ else:
 
         rows = fetch_with_retry(dbconn, query, "Timesheet query")
 
-        # day_data[(user, day)] = (total_minutes, all_approved)
+        # day_data[(user, day)] = (total_minutes, all_validated)
         day_data = {}
         for row in rows:
             day = row["entry_day"]
@@ -200,20 +200,20 @@ else:
                 day = date.fromisoformat(day[:10])
             day_data[(row["user_name"], day)] = (
                 row["total_minutes"] or 0,
-                bool(row["all_approved"]),
+                bool(row["all_validated"]),
             )
 
         # -----------------------------------------------------------------
         # Build shortfall list: every (user, day) under threshold, UNLESS
-        # every entry logged that day is approved. Days with zero entries
-        # have nothing to approve, so they're always included if < threshold.
+        # every entry logged that day is validated. Days with zero entries
+        # have nothing to validate, so they're always included if < threshold.
         # -----------------------------------------------------------------
 
         shortfalls = []  # list of (user, day, minutes)
         for user in USER_LIST:
             for day in days_to_check:
-                minutes, all_approved = day_data.get((user, day), (0, False))
-                if minutes < DAILY_THRESHOLD_MINUTES and not all_approved:
+                minutes, all_validated = day_data.get((user, day), (0, False))
+                if minutes < DAILY_THRESHOLD_MINUTES and not all_validated:
                     shortfalls.append((user, day, minutes))
 
         shortfalls.sort(key=lambda x: (x[1], x[0]))
@@ -247,8 +247,8 @@ else:
                     lines.append(format_shortfall_line(day, minutes))
                 lines.append("")
                 lines.append(
-                    "If any of these are already covered by approved leave or time off, "
-                    "check with your team lead so they can be marked approved."
+                    "If any of these are already covered by leave or time off, "
+                    "check with your team lead so they can be marked validated."
                 )
                 lines.append("\nAdd/Edit your entries: <https://app.eu.peliqan.io/apps/dkV4ZE1JMW5obnhsblFJemM5anhKZEQ5UTZYWVp6TTNLZmhPRDJEcXZxeDljcnBndTBWcndnaWpIVmRoYjJwaw==/|Timesheet Calendar>")
                 text = "\n".join(lines)

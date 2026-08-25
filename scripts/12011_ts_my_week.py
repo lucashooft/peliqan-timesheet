@@ -34,10 +34,12 @@ ts_prod.users.scope, cumulative):
       - viewing someone else's week: read-only; if that week is
         submitted, a Validate button appears.
   - Validate is the terminal step, defined by validate_week() below:
-    every timetable entry of that user in that week gets approved=true +
-    approved_by, and the submission row becomes status='confirmed' with
-    confirmed_by / confirmed_at. Approved entries are then locked for
-    everyone, here and in ts_mcp_server, which refuses to write to them.
+    every timetable entry of that user in that week is stamped
+    approved=true + approved_by, and the submission row becomes
+    status='confirmed' with confirmed_by / confirmed_at. Validated entries
+    are then locked for everyone, here and in ts_mcp_server, which refuses
+    to write to them. (Those columns keep their database names; everything
+    a user reads says validated.)
 
 Navigation: a date picker ("Show week of") jumps to the week containing
 any date, with explicit "Previous week" / "Next week" buttons next to it
@@ -327,12 +329,13 @@ def unsubmit_week(user_id, week_start):
 def validate_week(user_id, week_start, validated_by_id, existing_submission):
     """Validate a week. This function IS the contract the other surfaces
     read back, so both halves matter: every timetable entry of the user in
-    that week gets approved=true + approved_by, and the submission row
-    becomes status='confirmed'. ts_mcp_server refuses writes on approved
-    entries AND on a confirmed week; this app's grid goes read-only on
-    either. Entries are approved before the submission is confirmed, so a
-    failure part-way leaves the week merely submitted - still locked, and
-    safe to retry, since re-approving an approved entry is a no-op."""
+    that week gets approved=true + approved_by (the column names, kept as
+    they are), and the submission row becomes status='confirmed'.
+    ts_mcp_server refuses writes on a validated entry AND on a validated
+    week; this app's grid goes read-only on either. Entries are stamped
+    before the submission is, so a failure part-way leaves the week merely
+    submitted - still locked, and safe to retry, since re-stamping an
+    already-validated entry is a no-op."""
     dbconn = pq.dbconnect(DW_NAME)
     key = submission_key(user_id, week_start)
     week_end = week_start + timedelta(days=6)
@@ -421,7 +424,7 @@ def entry_dialog(entry, lookup, editable):
         st.caption(entry["internal_description"])
 
     if not editable:
-        st.info("This entry is read-only (week submitted/validated, entry approved, or not your calendar).")
+        st.info("This entry is read-only (week submitted/validated, entry validated, or not your calendar).")
         return
 
     with st.form("edit_form", border=False):
@@ -447,7 +450,7 @@ def entry_dialog(entry, lookup, editable):
 @st.dialog("Submit week")
 def submit_dialog(user_id, week_start, day_totals):
     week_end = week_start + timedelta(days=6)
-    st.write(f"Submit **{week_start.strftime('%d %b')} to {week_end.strftime('%d %b %Y')}** for approval?")
+    st.write(f"Submit **{week_start.strftime('%d %b')} to {week_end.strftime('%d %b %Y')}** for validation?")
     shortfalls = []
     for i in WORKDAYS:
         total = day_totals.get(week_start + timedelta(days=i), 0)
@@ -475,8 +478,8 @@ def validate_dialog(target_user, week_start, validated_by_id, existing_submissio
         f"Validate the week of **{week_start.strftime('%d %b')} to {week_end.strftime('%d %b %Y')}** "
         f"for **{user_display_name(target_user)}**?"
     )
-    st.caption("This approves every entry in the week (approved = true) and marks the "
-               "submission as confirmed. Approved entries can no longer be edited by anyone.")
+    st.caption("This validates every entry in the week and marks the submission "
+               "as confirmed. Validated entries can no longer be edited by anyone.")
     if st.button("Validate week", type="primary", use_container_width=True, key="validate_ok"):
         validate_week(to_int(target_user.get("id")), week_start, validated_by_id, existing_submission)
         st.rerun()
@@ -1231,7 +1234,7 @@ if not bars_df.empty:
     fig.data[-1].hovertemplate = "%{hovertext}<extra></extra>"
     fig.data[-1].hovertext = [
         f"<b>{r.client}</b> - {r.task}<br>{r.tijd} ({r.duur})"
-        + ("<br>approved (locked)" if r.locked else "")
+        + ("<br>validated (locked)" if r.locked else "")
         + (f"<br><i>{r.note}</i>" if r.note else "")
         for r in bars_df.itertuples()
     ]
@@ -1314,7 +1317,7 @@ if untimed:
             entry_dialog(e, lookup, editable=can_edit and not is_true(e.get("approved")))
 
 if is_confirmed:
-    st.caption("Week is validated: all entries are approved and read-only.")
+    st.caption("Week is validated: all entries are validated and read-only.")
 elif wk_status == "submitted":
     st.caption("Week is submitted: the grid is read-only."
                + (" Use Unsubmit to make changes." if is_self else ""))

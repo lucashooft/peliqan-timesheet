@@ -104,7 +104,7 @@ EXPORT_COLUMNS = [
     ("project", "Project"),
     ("task", "Task"),
     ("note", "Note"),
-    ("approved", "Approved"),
+    ("approved", "Validated"),
 ]
 
 
