@@ -1,53 +1,34 @@
-if 'RUN_CONTEXT' in globals():  # Running on Peliqan
-    RUN_ENV = 'peliqan'
-else:  # Running outside of Peliqan
-    RUN_ENV = 'local'
-    from peliqan import Peliqan
-    import streamlit as st
+if 'RUN_CONTEXT' not in globals():  # Running outside of Peliqan
     import os
+    import streamlit as st
+    from peliqan import Peliqan
     api_key = os.getenv("PELIQAN_API_KEY")
     if not api_key:
         st.error("PELIQAN_API_KEY environment variable is not set.")
         st.stop()
-    interface_id = os.getenv("PELIQAN_INTERFACE_ID", 0)
     pq = Peliqan(api_key)
-    try:
-        from streamlit.runtime.scriptrunner import get_script_run_ctx
-        if get_script_run_ctx() is not None:
-            RUN_CONTEXT = "interactive"
-    except Exception:
-        RUN_CONTEXT = "background"
 
 """
 ts_my_week (v4.2) - POC
 
 Google-Calendar-style week view for timesheet entries, reload-free.
 
-Access: a Google OAuth login is built in but switched OFF. Two flags in
-the "Google login" section drive it:
+Access: the Google login is mandatory. Nothing renders but a sign-in
+page until the visitor completes a Google login whose verified email
+matches a row in ts_prod.users - the same rule ts_mcp_server applies to
+its Bearer tokens. Needs three Secret Store entries and the redirect URI
+registered in Google Cloud; the login then lives in an encrypted cookie
+for 12 hours. The logged-in user IS the viewer.
 
-  - GOOGLE_LOGIN_ENABLED = False (current): the login is bypassed and the
-    app behaves exactly as it did before OAuth was added. No secret is
-    read, no sign-in page appears, and there is NO access control - so
-    the app must not be published as "Public" in this state.
-  - GOOGLE_LOGIN_ENABLED = True: the app renders nothing but a sign-in
-    page until the visitor completes a Google login whose verified email
-    matches a row in ts_prod.users - the same rule ts_mcp_server applies
-    to its Bearer tokens. Needs three Secret Store entries and the
-    redirect URI registered in Google Cloud; the login then lives in an
-    encrypted cookie for 12 hours.
-  - IDENTIFY_BY_LOGIN = False keeps the "I am" selectbox for testing;
-    True makes the logged-in user the only identity.
+Monthly Excel export lives in its own Data App (ts_monthly_view), not
+here.
 
 Who-sees-what (mirrors ts_weekly_calendar / ts_mcp_server's scope model,
 ts_prod.users.scope, cumulative):
-  - "I am" selectbox at the top: pick which user you are (testing only,
-    preselected on the logged-in user; removed by IDENTIFY_BY_LOGIN).
   - Scope 1 (employee): sees only their OWN weekly calendar. Can add/edit/
     delete entries while the week is open, and Submit / Unsubmit it.
-  - Scope 2+ (manager/admin): gets a second "Viewing" selectbox to open
-    anyone's calendar, and the only "Export to Excel" button - scope 1
-    never sees it.
+  - Scope 2+ (manager/admin): gets a "Viewing" selectbox to open anyone's
+    calendar, read-only, plus Validate on a submitted week.
       - viewing their own week: Submit / Unsubmit, plus Validate once
         the week is submitted (managers may validate their own week).
       - viewing someone else's week: read-only; if that week is
@@ -87,7 +68,6 @@ lifts that call into a system prepend that runs before this script body.
 
 import base64
 import hashlib
-import io
 import hmac
 import json
 import secrets
@@ -115,10 +95,7 @@ st.markdown("<style>.block-container{padding-top:2.2rem;}</style>",
 DW_NAME = "dw_3202"
 S = "ts_prod"
 
-DEFAULT_USER_ID = 7          # "I am" fallback when the login has no id (Sander)
-FIRST_EXPORT_MONTH = date(2026, 7, 1)   # no usable timesheet data before this
 MANAGE_SCOPE = 2             # scope >= 2 can view anyone + validate
-SCOPE_LABELS = {1: "employee", 2: "manager", 3: "admin"}
 
 DAY_TARGET_MIN = 8 * 60      # minimum per workday
 WORKDAYS = (0, 1, 2, 3, 4)
@@ -133,6 +110,9 @@ ROW_PX = 52                  # pixels per hour row
 
 CLIENT_COLORS = ["#4c78a8", "#54a24b", "#b279a2", "#f58518",
                  "#e45756", "#eeca3b", "#9d755d", "#72b7b2"]
+
+# Stand-in for an entry whose task_id is no longer in the lookup.
+LOOKUP_DEFAULT = {"task": "?", "project": "-", "client": "-", "color": "#9d9da6"}
 
 # =====================================================
 # Helpers
@@ -240,170 +220,6 @@ def load_submissions(user_id):
         return {}
     return {str(r.get("id")): r for r in rows}
 
-
-def refresh_entries():
-    load_entries.clear()
-
-
-def refresh_submissions():
-    load_submissions.clear()
-
-# =====================================================
-# Monthly export view  (SHARED BLOCK - keep byte-identical with
-# ts_monthly_view / 12507_ts_monthly_view.py)
-#
-# Two Data Apps cannot import each other, so this block is duplicated.
-# Edit it in one place and copy it to the other.
-#
-# One view per calendar month: ts_reporting.v_monthly_entries_2026_08 and
-# so on. The month window is baked into each view's SQL, so reading one
-# needs no date filter - ask for the month by name.
-#
-# Sourced from the live ts_prod tables on purpose, NOT from
-# ts_reporting.fact_timetable: that one is a materialized query table and
-# does not reflect writes until its underlying query is re-run (see the
-# note in ts_weekly_calendar's load_timetable_approval_map). A plain view
-# over ts_prod is always current, which is what an export needs.
-# =====================================================
-
-VIEW_SCHEMA = "ts_reporting"
-VIEW_PREFIX = "v_monthly_entries_"
-
-EXPORT_COLUMNS = [
-    ("employee", "Employee"),
-    ("entry_day", "Date"),
-    ("start_time", "Start"),
-    ("duration_hours", "Hours"),
-    ("billable", "Billable"),
-    ("client", "Client"),
-    ("project", "Project"),
-    ("task", "Task"),
-    ("note", "Note"),
-    ("approved", "Approved"),
-]
-
-
-def month_bounds(month_start):
-    """(first day, first day of next month) - one view's window."""
-    if month_start.month == 12:
-        return month_start, date(month_start.year + 1, 1, 1)
-    return month_start, date(month_start.year, month_start.month + 1, 1)
-
-
-def view_name(month_start):
-    return f"{VIEW_PREFIX}{month_start.strftime('%Y_%m')}"
-
-
-def monthly_view_sql(month_start):
-    start, end = month_bounds(month_start)
-    return f"""
-SELECT
-    t.id                                      AS entry_id,
-    t.user_id::text                           AS user_id,
-    COALESCE(u.name, u.email, 'Unknown user') AS employee,
-    t.date                                    AS entry_date,
-    CAST(t.date AS DATE)                      AS entry_day,
-    COALESCE(t.duration, 0)                   AS duration_minutes,
-    ROUND(COALESCE(t.duration, 0) / 60.0, 2)  AS duration_hours,
-    COALESCE(tk.billable, FALSE)              AS billable,
-    COALESCE(c.name, '-')                     AS client,
-    COALESCE(p.name, '-')                     AS project,
-    COALESCE(tk.name, '-')                    AS task,
-    COALESCE(t.internal_description, '')      AS note,
-    COALESCE(t.approved, FALSE)               AS approved
-FROM {S}.timetable t
-LEFT JOIN {S}.users    u  ON u.id::text = t.user_id::text
-LEFT JOIN {S}.tasks    tk ON tk.id = t.task_id
-LEFT JOIN {S}.projects p  ON p.id = tk.project_id
-LEFT JOIN {S}.clients  c  ON c.id = p.client_id
-WHERE t.date >= TIMESTAMP '{start.isoformat()} 00:00:00'
-  AND t.date <  TIMESTAMP '{end.isoformat()} 00:00:00'
-ORDER BY employee, t.date
-"""
-
-
-def ensure_monthly_view(month_start):
-    """
-    Create this month's view, or update it in place when the SQL changed.
-    Idempotent: upsert_query looks the table up by name first and only
-    falls back to creating it when it does not exist yet.
-    """
-    return pq.upsert_query(
-        name=view_name(month_start),
-        query=monthly_view_sql(month_start),
-        schema_name=VIEW_SCHEMA,
-        database_name=DW_NAME,
-        as_view=True,
-    )
-
-
-def fetch_month(month_start, user_id=None):
-    """
-    One month's view, ordered employee then date. The view is already
-    scoped to the month, so only the employee filter is applied here.
-    user_id=None means every employee.
-    """
-    where = "" if user_id is None else f"WHERE user_id = '{int(user_id)}'"
-    dbconn = pq.dbconnect(DW_NAME)
-    rows = dbconn.fetch(DW_NAME, query=f"""
-        SELECT * FROM {VIEW_SCHEMA}.{view_name(month_start)}
-        {where}
-        ORDER BY employee, entry_date
-    """) or []
-    df = pd.DataFrame(rows)
-    if df.empty:
-        return df
-    dt = pd.to_datetime(df["entry_date"], errors="coerce")
-    df["start_time"] = dt.dt.strftime("%H:%M")
-    df["entry_day"] = dt.dt.strftime("%Y-%m-%d")
-    return df
-
-
-def build_workbook(df, sheet_title):
-    """The month as .xlsx bytes. openpyxl is available in the runtime."""
-    from openpyxl import Workbook
-    from openpyxl.styles import Alignment, Font, PatternFill
-    from openpyxl.utils import get_column_letter
-
-    wb = Workbook()
-    ws = wb.active
-    ws.title = sheet_title[:31]                  # Excel's hard limit
-
-    header_font = Font(bold=True, color="FFFFFF")
-    header_fill = PatternFill("solid", fgColor="053763")
-    for col, (_, label) in enumerate(EXPORT_COLUMNS, start=1):
-        cell = ws.cell(row=1, column=col, value=label)
-        cell.font = header_font
-        cell.fill = header_fill
-        cell.alignment = Alignment(horizontal="center")
-
-    for r, row in enumerate(df.to_dict("records") if not df.empty else [], start=2):
-        for col, (key, _) in enumerate(EXPORT_COLUMNS, start=1):
-            value = row.get(key)
-            if key in ("approved", "billable"):
-                value = "yes" if value in (True, "true", "True", 1, "1") else "no"
-            elif key == "duration_hours":
-                value = float(value or 0)
-            ws.cell(row=r, column=col, value=value)
-
-    widths = {"employee": 22, "entry_day": 12, "start_time": 8, "duration_hours": 8,
-              "billable": 9, "client": 20, "project": 24, "task": 28, "note": 50,
-              "approved": 10}
-    for col, (key, _) in enumerate(EXPORT_COLUMNS, start=1):
-        ws.column_dimensions[get_column_letter(col)].width = widths.get(key, 16)
-
-    ws.freeze_panes = "A2"
-    if not df.empty:
-        ws.auto_filter.ref = f"A1:{get_column_letter(len(EXPORT_COLUMNS))}{len(df) + 1}"
-
-    buf = io.BytesIO()
-    wb.save(buf)
-    return buf.getvalue()
-
-
-def export_filename(month_start, who):
-    return f"timesheet_{month_start.strftime('%Y-%m')}_{who}.xlsx"
-
 # =====================================================
 # Writes
 # =====================================================
@@ -421,7 +237,7 @@ def insert_entry(user_id, task_id, entry_dt, duration_minutes, note):
         "approved": None,
         "approved_by": None,
     })
-    refresh_entries()
+    load_entries.clear()
 
 
 def update_entry(entry_id, task_id, entry_dt, duration_minutes, note):
@@ -432,13 +248,13 @@ def update_entry(entry_id, task_id, entry_dt, duration_minutes, note):
         "duration": int(duration_minutes),
         "internal_description": (note or "").strip(),
     })
-    refresh_entries()
+    load_entries.clear()
 
 
 def delete_entry(entry_id):
     dbconn = pq.dbconnect(DW_NAME)
     dbconn.execute(DW_NAME, query=f"DELETE FROM {S}.timetable WHERE id = {int(entry_id)}")
-    refresh_entries()
+    load_entries.clear()
 
 
 def submit_week(user_id, week_start):
@@ -453,7 +269,7 @@ def submit_week(user_id, week_start):
         "confirmed_by": None,
         "confirmed_at": None,
     })
-    refresh_submissions()
+    load_submissions.clear()
 
 
 def unsubmit_week(user_id, week_start):
@@ -462,7 +278,7 @@ def unsubmit_week(user_id, week_start):
     dbconn.execute(DW_NAME, query=(
         f"DELETE FROM {S}.timetable_submissions "
         f"WHERE id = '{key}' AND status = 'submitted'"))
-    refresh_submissions()
+    load_submissions.clear()
 
 
 def validate_week(user_id, week_start, validated_by_id, existing_submission):
@@ -482,8 +298,11 @@ def validate_week(user_id, week_start, validated_by_id, existing_submission):
     for row in rows:
         rid = to_int(row.get("id"))
         if rid is not None:
+            # A real bool, not "true": ts_prod.timetable.approved is a boolean
+            # column and the write proxy tries Decimal() on string values,
+            # so "true" comes back as a 400 (decimal.ConversionSyntax).
             dbconn.update(DW_NAME, S, "timetable", rid,
-                          {"approved": "true", "approved_by": int(validated_by_id)})
+                          {"approved": True, "approved_by": int(validated_by_id)})
 
     dbconn.upsert(DW_NAME, S, "timetable_submissions", key, {
         "id": key,
@@ -494,8 +313,8 @@ def validate_week(user_id, week_start, validated_by_id, existing_submission):
         "confirmed_by": int(validated_by_id),
         "confirmed_at": datetime.utcnow().isoformat(),
     })
-    refresh_entries()
-    refresh_submissions()
+    load_entries.clear()
+    load_submissions.clear()
 
 # =====================================================
 # Dialogs
@@ -523,8 +342,7 @@ def add_dialog(user_id, day, lookup, default_start=time(9, 0)):
 
 @st.dialog("Entry")
 def entry_dialog(entry, lookup, editable):
-    info = lookup.get(to_int(entry.get("task_id")),
-                      {"task": "?", "project": "-", "client": "-", "color": "#9d9da6"})
+    info = lookup.get(to_int(entry.get("task_id")), LOOKUP_DEFAULT)
     dt = entry["dt"]
     st.markdown(
         f"**{info['task']}**  \n"
@@ -596,113 +414,21 @@ def validate_dialog(target_user, week_start, validated_by_id, existing_submissio
         validate_week(to_int(target_user.get("id")), week_start, validated_by_id, existing_submission)
         st.rerun()
 
-
-def month_options():
-    """Every exportable month, newest first: FIRST_EXPORT_MONTH to now."""
-    today = date.today()
-    m = date(today.year, today.month, 1)
-    out = []
-    while m >= FIRST_EXPORT_MONTH:
-        out.append(m)
-        m = date(m.year - 1, 12, 1) if m.month == 1 else date(m.year, m.month - 1, 1)
-    return out or [FIRST_EXPORT_MONTH]
-
-
-def name_slug(user):
-    text = str(user_display_name(user)).lower()
-    return "".join(ch if ch.isalnum() else "_" for ch in text).strip("_") or "employee"
-
-
-@st.dialog("Export to Excel")
-def export_dialog(can_manage, user_ids, user_by_id, default_month):
-    """
-    Pick a month and whose entries, build the file, then download it.
-
-    Two steps on purpose: building means asserting the month's view and
-    querying it, which is too slow to do on every keystroke, and
-    st.download_button needs the bytes in hand before it can be drawn.
-
-    Managers only. An export reaches across every employee and every week,
-    including weeks the viewer cannot open in the calendar, so the button
-    that opens this is itself behind can_manage - the check below is the
-    second lock, not the first.
-    """
-    if not can_manage:
-        st.error("Exporting is limited to managers.")
-        return
-
-    months = month_options()
-    # The week on screen can sit outside that range - navigate far enough
-    # back or forward - so fall back to the newest month rather than
-    # offering one the range does not contain.
-    default = default_month if default_month in months else months[0]
-    export_month = st.selectbox(
-        "Month", months, index=months.index(default), key="export_month",
-        format_func=lambda d: d.strftime("%B %Y"),
-    )
-
-    export_who = st.selectbox(
-        "Employees", ["all"] + user_ids, index=0, key="export_who",
-        format_func=lambda w: ("All employees" if w == "all"
-                               else user_display_name(user_by_id[w])),
-    )
-
-    if st.button("Create export", type="primary", use_container_width=True,
-                 key="export_build"):
-        try:
-            with st.spinner("Updating the view and collecting entries..."):
-                ensure_monthly_view(export_month)
-                target = None if export_who == "all" else int(export_who)
-                rows = fetch_month(export_month, target)
-                who_label = ("all_employees" if export_who == "all"
-                             else name_slug(user_by_id[export_who]))
-                st.session_state.export_blob = (
-                    (export_month, export_who),        # what these bytes are for
-                    export_filename(export_month, who_label),
-                    build_workbook(rows, export_month.strftime("%b %Y")),
-                    len(rows),
-                )
-        except Exception as exc:
-            st.session_state.export_blob = None
-            st.error(f"Export failed: {exc}")
-
-    # Read AFTER the build button so the file is offered in the same run.
-    # A file built for other settings is stale the moment they change.
-    blob = st.session_state.get("export_blob")
-    if not blob or blob[0] != (export_month, export_who):
-        return
-    _, fname, data, count = blob
-    if not count:
-        st.info("No entries logged in that month - nothing to export.")
-        return
-    st.success(f"{count} entries ready.")
-    st.download_button(
-        f"Download {fname}", data=data, file_name=fname,
-        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-        type="primary", use_container_width=True, key="export_download",
-    )
-
 # =====================================================
 # Grid model builders (pure functions -> unit-testable)
 # =====================================================
 
 def assign_lanes(evs):
     """Greedy lanes for overlapping events -> [(event, lane, n_lanes)]."""
-    evs = sorted(evs, key=lambda e: (e["dt"], -int(e["duration"])))
-    out = []
-    for e in evs:
+    out = []                        # [event, lane, start_min, end_min]
+    for e in sorted(evs, key=lambda e: (e["dt"], -int(e["duration"]))):
         s = e["dt"].hour * 60 + e["dt"].minute
         en = s + max(int(e["duration"]), 15)
-        used = {o[1] for o in out if o[2] < en and o[3] > s}
-        lane = 0
-        while lane in used:
-            lane += 1
-        out.append([e, lane, s, en])
-    result = []
-    for e, lane, s, en in out:
-        group = [o for o in out if o[2] < en and o[3] > s]
-        result.append((e, lane, max(o[1] for o in group) + 1))
-    return result
+        taken = {o[1] for o in out if o[2] < en and o[3] > s}
+        out.append([e, next(i for i in range(len(taken) + 1) if i not in taken), s, en])
+    # n_lanes is only known once every overlapping event has a lane
+    return [(e, lane, max(o[1] for o in out if o[2] < en and o[3] > s) + 1)
+            for e, lane, s, en in out]
 
 
 def build_grid_frames(week_df, days, lookup):
@@ -730,10 +456,9 @@ def build_grid_frames(week_df, days, lookup):
     end_h = min(24, max(end_h, start_h + 1))
 
     rows = []
-    default = {"task": "?", "project": "-", "client": "-", "color": "#9d9da6"}
     for i, d in enumerate(days):
         for e, lane, n_lanes in assign_lanes(timed.get(d, [])):
-            info = lookup.get(to_int(e.get("task_id")), default)
+            info = lookup.get(to_int(e.get("task_id")), LOOKUP_DEFAULT)
             start = e["dt"].hour + e["dt"].minute / 60
             dur_h = max(int(e["duration"]), 15) / 60
             locked = is_true(e.get("approved"))
@@ -768,10 +493,9 @@ def occupied_slots(bars_df):
     busy = {}
     if bars_df is None or bars_df.empty:
         return busy
-    import math
     for r in bars_df.itertuples():
-        lo = int(math.floor(float(r.y0) * SLOTS_PER_H))
-        hi = int(math.ceil(float(r.y1) * SLOTS_PER_H))
+        lo = round(float(r.y0) * 60) // SLOT_MIN            # floor
+        hi = -(-round(float(r.y1) * 60) // SLOT_MIN)        # ceil
         busy.setdefault(int(r.day_i), set()).update(range(lo, max(hi, lo + 1)))
     return busy
 
@@ -800,23 +524,10 @@ def build_cells_frame(days, start_h, end_h, bars_df=None):
 def selected_customdata(event):
     """Pull customdata lists from a st.plotly_chart on_select event,
     preferring entry clicks over cell clicks when both are hit."""
-    try:
-        points = event.selection["points"]
-    except Exception:
-        points = getattr(getattr(event, "selection", None), "points", None)
-    if not points:
-        return None
-    datas = []
-    for p in points:
-        cd = p.get("customdata") if isinstance(p, dict) else getattr(p, "customdata", None)
-        if cd:
-            datas.append(list(cd))
-    if not datas:
-        return None
-    for cd in datas:                 # an entry bar wins over the cell under it
-        if cd and cd[0] == "entry":
-            return cd
-    return datas[0]
+    points = (event.get("selection") or {}).get("points") or []
+    datas = [list(p["customdata"]) for p in points if p.get("customdata")]
+    # an entry bar wins over the cell under it
+    return next((cd for cd in datas if cd[0] == "entry"), datas[0] if datas else None)
 
 # =====================================================
 # Google login (OAuth 2.0 authorization code flow)
@@ -865,24 +576,6 @@ SESSION_HOURS = 12            # how long one login stays valid
 STATE_MAX_AGE = 30 * 60       # a started login must be completed within this
 COOKIE_PREFIX = "ts_my_week_"
 COOKIE_SESSION = "session"
-
-# Master switch. While False the login is bypassed entirely: the app
-# behaves exactly as it did before Google OAuth was added, none of the
-# three secrets below is read and no sign-in page appears. Flip to True
-# once the secrets exist and the redirect URI is registered in Google.
-# WARNING: False means no access control at all - do not leave the app
-# published as "Public" in that state.
-GOOGLE_LOGIN_ENABLED = True
-
-# POC switch: False keeps the "I am" selectbox for testing (the logged-in
-# user is preselected). Flip to True once the login flow is verified -
-# the viewer is then always the logged-in user and the selectbox is gone.
-# Ignored while GOOGLE_LOGIN_ENABLED is False: there is no login to use.
-IDENTIFY_BY_LOGIN = True
-
-# Shows the redirect URI in use and which query parameters reached the
-# app - the two things that break first. Set to False once verified.
-LOGIN_DEBUG = False
 
 
 class LoginError(Exception):
@@ -1117,12 +810,6 @@ def login_page(message=None):
     )
     if st.session_state.get("cookies_unavailable"):
         st.caption("Cookies are unavailable here, so a page refresh will ask you to sign in again.")
-    if LOGIN_DEBUG:
-        with st.expander("Login diagnostics"):
-            st.write("redirect_uri sent to Google (must match Google Cloud byte for byte):")
-            st.code(REDIRECT_URI)
-            st.write("Query parameters this app received:",
-                     sorted(st.query_params.keys()) or "none")
     st.stop()
 
 
@@ -1144,80 +831,75 @@ def match_login_to_user(email):
             return u
     return None
 
-# ---- the gate: with the login on, nothing below here runs unauthenticated ----
+# ---- the gate: nothing below here runs unauthenticated ----
 
-cookies = None          # cookie jar, only while the login is on
-auth = None             # {"email", "name", "exp"} of the signed-in visitor
-LOGIN_USER_ID = None    # their ts_prod.users id
+try:
+    oauth_config()
+except Exception:
+    st.error(
+        "Google login is not configured yet. Add these three entries to the "
+        f"Peliqan Secret Store: {SECRET_CLIENT_ID}, {SECRET_CLIENT_SECRET} "
+        f"and {SECRET_COOKIE_PASSWORD}."
+    )
+    st.stop()
 
-if GOOGLE_LOGIN_ENABLED:
-    try:
-        oauth_config()
-    except Exception:
-        st.error(
-            "Google login is not configured yet. Add these three entries to the "
-            f"Peliqan Secret Store: {SECRET_CLIENT_ID}, {SECRET_CLIENT_SECRET} "
-            f"and {SECRET_COOKIE_PASSWORD}."
-        )
-        st.stop()
+cookies = init_cookies()
+if cookies is not None and not cookies.ready():
+    st.stop()                    # cookie component still initialising
 
-    cookies = init_cookies()
-    if cookies is not None and not cookies.ready():
-        st.stop()                    # cookie component still initialising
+auth = read_session(cookies)
 
-    auth = read_session(cookies)
-
-    if auth is None:
-        params = st.query_params
-        if params.get("error"):
-            denied = f"Google did not complete the login ({str(params.get('error'))})."
-            st.session_state.login_message = denied
-            clear_login_params()
-            login_page(denied)
-        code = params.get("code")
-        if not code:
-            login_page()
-        # Spend a code once per session: a rerun must not resubmit it.
-        # Reset by a hard refresh, which starts a fresh session - the
-        # StaleCodeError branch below is what covers that case.
-        consumed = st.session_state.setdefault("consumed_codes", set())
-        if str(code) in consumed:
-            clear_login_params()
-            login_page()
-        consumed.add(str(code))
-        try:
-            state_rand = read_state(params.get("state"))
-            identity = read_identity(exchange_code(code), nonce_for(state_rand))
-        except StaleCodeError:
-            clear_login_params()     # leftover ?code=, not a failed login
-            login_page()
-        except LoginError as exc:
-            st.session_state.login_message = str(exc)
-            clear_login_params()
-            login_page(str(exc))
-        # Session first, then drop ?code= from our own URL. That is all
-        # this app can reach: the copy on the top-level window survives,
-        # so a replay is caught by StaleCodeError rather than prevented.
-        auth = store_session(cookies, identity["email"], identity["name"])
+if auth is None:
+    params = st.query_params
+    if params.get("error"):
+        denied = f"Google did not complete the login ({str(params.get('error'))})."
+        st.session_state.login_message = denied
         clear_login_params()
+        login_page(denied)
+    code = params.get("code")
+    if not code:
+        login_page()
+    # Spend a code once per session: a rerun must not resubmit it.
+    # Reset by a hard refresh, which starts a fresh session - the
+    # StaleCodeError branch below is what covers that case.
+    consumed = st.session_state.setdefault("consumed_codes", set())
+    if str(code) in consumed:
+        clear_login_params()
+        login_page()
+    consumed.add(str(code))
+    try:
+        state_rand = read_state(params.get("state"))
+        identity = read_identity(exchange_code(code), nonce_for(state_rand))
+    except StaleCodeError:
+        clear_login_params()     # leftover ?code=, not a failed login
+        login_page()
+    except LoginError as exc:
+        st.session_state.login_message = str(exc)
+        clear_login_params()
+        login_page(str(exc))
+    # Session first, then drop ?code= from our own URL. That is all
+    # this app can reach: the copy on the top-level window survives,
+    # so a replay is caught by StaleCodeError rather than prevented.
+    auth = store_session(cookies, identity["email"], identity["name"])
+    clear_login_params()
+    st.rerun()
+
+elif "code" in st.query_params:
+    clear_login_params()    # already signed in: drop a stale code from the URL
+
+login_user = match_login_to_user(auth["email"])
+if login_user is None:
+    st.title("My week")
+    st.error(
+        f"{auth['email']} is not a timesheet user. Ask an administrator to add this "
+        "email address to the users table, or sign in with another account."
+    )
+    if st.button("Sign in with another account", key="switch_account"):
+        end_session(cookies)
         st.rerun()
+    st.stop()
 
-    elif "code" in st.query_params:
-        clear_login_params()    # already signed in: drop a stale code from the URL
-
-    login_user = match_login_to_user(auth["email"])
-    if login_user is None:
-        st.title("My week")
-        st.error(
-            f"{auth['email']} is not a timesheet user. Ask an administrator to add this "
-            "email address to the users table, or sign in with another account."
-        )
-        if st.button("Sign in with another account", key="switch_account"):
-            end_session(cookies)
-            st.rerun()
-        st.stop()
-
-    LOGIN_USER_ID = to_int(login_user.get("id"))
+LOGIN_USER_ID = to_int(login_user.get("id"))
 
 # =====================================================
 # State
@@ -1244,26 +926,13 @@ user_ids = list(user_by_id.keys())
 
 # One row for everything at the top, bottom-aligned so the buttons sit on
 # the same baseline as the inputs beside them rather than level with their
-# labels. Weights sum to 10.0 and export_col is 2.0, matching status_col in
-# the header row below so the two buttons render the same width.
-# gap_col is deliberately left empty, separating the filters from the
-# actions that have nothing to do with them.
-id_col, view_col, week_col, gap_col, export_col, acct_col = st.columns(
-    [2.2, 2.2, 1.6, 0.4, 2.0, 1.6], vertical_alignment="bottom")
+# labels. Weights sum to 10.0; gap_col is deliberately left empty,
+# separating the filters from the account popover on the right.
+view_col, week_col, gap_col, acct_col = st.columns(
+    [2.2, 1.6, 4.6, 1.6], vertical_alignment="bottom")
 
-# The viewer is whoever logged in with Google. While IDENTIFY_BY_LOGIN is
-# False the "I am" selectbox stays available for testing, preselected on
-# the logged-in user; flipping the switch removes it entirely.
-if IDENTIFY_BY_LOGIN and LOGIN_USER_ID is not None:
-    viewer_id = LOGIN_USER_ID
-else:
-    default_id = LOGIN_USER_ID if LOGIN_USER_ID in user_ids else DEFAULT_USER_ID
-    default_idx = user_ids.index(default_id) if default_id in user_ids else 0
-    viewer_id = id_col.selectbox(
-        "I am", user_ids, index=default_idx, key="viewer_id",
-        format_func=lambda i: f"{user_display_name(user_by_id[i])} "
-                              f"({SCOPE_LABELS.get(to_int(user_by_id[i].get('scope')), '?')})",
-    )
+# The viewer is whoever logged in with Google - there is no other identity.
+viewer_id = LOGIN_USER_ID
 viewer = user_by_id[viewer_id]
 viewer_scope = to_int(viewer.get("scope")) or 1
 can_manage = viewer_scope >= MANAGE_SCOPE
@@ -1284,21 +953,11 @@ is_self = viewing_id == viewer_id
 # The account collapses into a popover: a strip of its own above the
 # filters cost a whole row of height for two small things. The name is the
 # label, the address and Sign out live inside.
-if auth:
-    with acct_col.popover(auth["name"], use_container_width=True):
-        st.caption(auth["email"])
-        if st.button("Sign out", key="sign_out", use_container_width=True):
-            end_session(cookies)
-            st.rerun()
-
-# Exporting spans months, so it sits with the filters rather than anywhere
-# in the week grid. Managers only - scope 1 never sees the button.
-# Everything else happens in the dialog.
-if can_manage and export_col.button("Export to Excel", key="open_export",
-                                    use_container_width=True):
-    export_dialog(can_manage, user_ids, user_by_id,
-                  date(st.session_state.week_start.year,
-                       st.session_state.week_start.month, 1))
+with acct_col.popover(auth["name"], use_container_width=True):
+    st.caption(auth["email"])
+    if st.button("Sign out", key="sign_out", use_container_width=True):
+        end_session(cookies)
+        st.rerun()
 
 def go_to_week(new_start):
     st.session_state.week_start = new_start
@@ -1336,8 +995,7 @@ wk_status = (submission or {}).get("status")
 is_locked_week = wk_status in ("submitted", "confirmed")
 is_confirmed = wk_status == "confirmed"
 
-can_edit = is_self and not is_locked_week            # add/edit/delete entries
-can_submit = is_self and not is_locked_week
+can_edit = is_self and not is_locked_week   # add/edit/delete entries, and submit
 can_unsubmit = is_self and wk_status == "submitted"
 can_validate = can_manage and wk_status == "submitted"
 
@@ -1366,9 +1024,8 @@ if pending:
 # Header
 # =====================================================
 
-# Weights sum to 10.0, matching the filter row above, and status_col is
-# 2.0 like its export_col - so "Submit week" renders exactly as wide as
-# "Export to Excel". title_col absorbs the difference.
+# Weights sum to 10.0, matching the filter row above. title_col absorbs
+# whatever the buttons beside it do not use.
 prev_col, next_col, this_col, title_col, status_col = st.columns([1.15, 1.0, 1.0, 4.85, 2.0])
 
 if prev_col.button("Previous week", key="prev_week", use_container_width=True):
@@ -1394,14 +1051,14 @@ with status_col:
         st.success("Week validated" + (f" by {user_display_name(by)}" if by else ""))
     elif wk_status == "submitted":
         # No nested split: these fill status_col, so they come out the same
-        # width as "Submit week" in the other branch and as Export above.
+        # width as "Submit week" in the other branch.
         if can_validate and st.button("Validate", key="validate_btn", type="primary", use_container_width=True):
             validate_dialog(viewing_user, week_start, viewer_id, submission)
         if can_unsubmit and st.button("Unsubmit", key="unsubmit_btn", use_container_width=True):
             unsubmit_week(viewing_id, week_start)
             st.rerun()
     else:
-        if can_submit:
+        if can_edit:
             if st.button("Submit week", key="submit_week_btn", type="primary", use_container_width=True):
                 submit_dialog(viewing_id, week_start, day_totals)
         else:
@@ -1575,9 +1232,8 @@ if cd:
 if untimed:
     st.markdown("**No start time** <span style='color:#70757a;font-size:0.8rem;'>logged without a time - click to open</span>", unsafe_allow_html=True)
     u_cols = st.columns(min(len(untimed), 4))
-    default = {"task": "?", "project": "-", "client": "-", "color": "#9d9da6"}
     for j, e in enumerate(sorted(untimed, key=lambda x: x["dt"])):
-        info = lookup.get(to_int(e.get("task_id")), default)
+        info = lookup.get(to_int(e.get("task_id")), LOOKUP_DEFAULT)
         lock = " (locked)" if is_true(e.get("approved")) else ""
         lbl = f"{e['dt'].strftime('%a %d')} - {fmt_dur(e['duration'])} - {info['client']}{lock}"
         if u_cols[j % len(u_cols)].button(lbl, key=f"u_{e['id']}", use_container_width=True):
