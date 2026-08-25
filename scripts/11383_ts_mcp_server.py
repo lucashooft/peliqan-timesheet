@@ -183,6 +183,19 @@ Changes from v3.14:
     move into; delete_entry checks the entry's week. Binds every scope,
     like the per-entry approved lock. approve_entry is deliberately NOT
     locked - approving a submitted week is the point of submitting it.
+
+Changes from v3.15:
+  - update_time_entry and delete_entry now require ownership at EVERY
+    scope: a manager can no longer change or delete someone else's entry,
+    not even in an open week. This reverses v3.13 (which had itself
+    reversed v3.2) and is again an explicit request, not a bug fix. The
+    rule now matches ts_my_week exactly, whose grid has always been
+    read-only on another user's calendar regardless of week status: a
+    manager reviews a timesheet by validating it, not by rewriting it.
+    Reads are untouched - managers still see everyone's entries - and so
+    is approve_entry, which is how a manager acts on someone else's week.
+    ts_weekly_calendar, the one surface that let managers edit other
+    people's entries, has been deleted.
 """
 
 import json
@@ -1086,9 +1099,10 @@ def update_time_entry(
     external_description: str = "",
 ) -> dict:
     """
-    Update a time entry. Scope 1 can only update their own entries; scope
-    2 and 3 can update any entry (same ownership rule as delete_entry).
-    Only fields you provide are changed; entries that are already
+    Update a time entry. You can only update your OWN entries, whatever
+    your scope - a manager reviewing someone else's timesheet approves or
+    rejects it, they do not rewrite it (same ownership rule as
+    delete_entry). Only fields you provide are changed; entries that are already
     approved can no longer be edited, regardless of scope. The same goes
     for any entry in a submitted or validated week, and a new date may not
     move an entry into such a week - unsubmit it first.
@@ -1106,7 +1120,7 @@ def update_time_entry(
     entry = find_by_id(fetch_cached("ts_prod", "timetable"), entry_id)
     if not entry:
         return {"success": False, "error": "No entry found with this id."}
-    if CURRENT_USER.get("scope", 0) < 2 and str(entry.get("user_id")) != str(CURRENT_USER.get("user_id")):
+    if str(entry.get("user_id")) != str(CURRENT_USER.get("user_id")):
         return {"success": False, "error": "You can only update your own entries."}
     if entry.get("approved"):
         return {"success": False, "error": "This entry is already approved and can no longer be updated."}
@@ -1162,9 +1176,9 @@ def update_time_entry(
 @tool()
 def delete_entry(entry_id: int) -> dict:
     """
-    Delete a time entry. Scope 1 can only delete their own entries; scope
-    2 and 3 can delete any entry. An entry that is already approved
-    cannot be deleted by anyone, regardless of scope - same rule as
+    Delete a time entry. You can only delete your OWN entries, whatever
+    your scope - same ownership rule as update_time_entry. An entry that
+    is already approved cannot be deleted by anyone, regardless of scope - same rule as
     update_time_entry. Nor can an entry in a submitted or validated week,
     which is locked until that week is unsubmitted.
     :param entry_id: id of the timetable row to delete
@@ -1177,7 +1191,7 @@ def delete_entry(entry_id: int) -> dict:
     if not entry:
         return {"success": False, "error": "No entry found with this id."}
 
-    if CURRENT_USER.get("scope", 0) < 2 and str(entry.get("user_id")) != str(CURRENT_USER.get("user_id")):
+    if str(entry.get("user_id")) != str(CURRENT_USER.get("user_id")):
         return {"success": False, "error": "You can only delete your own entries."}
 
     if entry.get("approved"):
