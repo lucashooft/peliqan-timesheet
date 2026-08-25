@@ -27,13 +27,6 @@
     "name": "ts_mcp_server",
     "remote_hash": "2753c94da8dc7732529f1d29957b2b80c7383cbc2cb884ac67a50e568614469f"
   },
-  "11862": {
-    "filename": "11862_ts_weekly_calendar.py",
-    "group": 3382,
-    "local_hash": "3b80a8c605364ea15d5270d0dd400b31b2a281d4d42a4d50547f22f18e4e5753",
-    "name": "ts_weekly_calendar",
-    "remote_hash": "dfc253f1841231b34c9f5eb5781b6c4c5a1c7b6f9a8bbae8ff55b8aae3bf73ec"
-  },
   "11954": {
     "filename": "11954_ts_bi_dashboard.py",
     "group": 3382,

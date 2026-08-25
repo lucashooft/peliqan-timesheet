@@ -170,6 +170,19 @@ Changes from v3.13:
     entry (not just their own), same as delete_entry. This reverses the
     v3.2 behavior, which required ownership regardless of scope -
     explicitly changed on request, not a bug fix.
+
+Changes from v3.14:
+  - Submitted and validated weeks are now locked against writes, closing
+    a hole where the MCP could still add, edit, move or delete entries in
+    a week the UI had already frozen. ts_prod.timetable_submissions is
+    consulted on every timetable write (_week_lock_error): status
+    'submitted' or 'confirmed' refuses the call. Creates hook in through
+    RESOURCE_CONFIG["timetable"]["cross_field_check"], so log_time_entry
+    and log_time_entries are both covered; update_time_entry checks the
+    entry's current week AND, when the date changes, the week it would
+    move into; delete_entry checks the entry's week. Binds every scope,
+    like the per-entry approved lock. approve_entry is deliberately NOT
+    locked - approving a submitted week is the point of submitting it.
 """
 
 import json
@@ -450,6 +463,68 @@ def _check_project_dates(converted):
     return None
 
 
+# ---- week locks (ts_prod.timetable_submissions) ----------------------
+#
+# Submitting a week freezes it. timetable_submissions holds one row per
+# (user, week); while its status is 'submitted' or 'confirmed' no entry
+# in that week may be added, changed, moved or deleted - the same lock
+# ts_my_week / ts_weekly_calendar apply to their grids. Without this the
+# MCP was a way around those grids: an agent could still log, edit or
+# delete inside a week the user had already handed in.
+#
+# Absolute, like the per-entry approved lock: it binds every scope, so a
+# manager who needs to fix a submitted week unsubmits it first. A
+# validated week cannot be reopened at all - validating also sets
+# approved=true on every entry, which the approved checks already refuse.
+
+SUBMISSIONS_TABLE = "timetable_submissions"
+LOCKED_WEEK_STATUSES = {"submitted": "submitted for approval",
+                        "confirmed": "validated"}
+
+
+def _week_start_of(value):
+    """Monday of the week a timetable 'date' falls in, or None if unreadable."""
+    # [:19] keeps 'YYYY-MM-DDTHH:MM:SS' and drops any fractional seconds or
+    # 'Z' suffix - Python 3.10's fromisoformat (the runtime) rejects those,
+    # and an unread date here would fail OPEN, letting a locked week through.
+    try:
+        parsed = datetime.fromisoformat(str(value).strip()[:19])
+    except (ValueError, TypeError, AttributeError):
+        return None
+    return parsed.date() - timedelta(days=parsed.weekday())
+
+
+def _week_lock_error(user_id, entry_date, action):
+    """The reason this week is closed, or None when it is open."""
+    week_start = _week_start_of(entry_date)
+    if week_start is None:
+        return None      # unreadable date: the field-level checks report that
+    for row in fetch_cached("ts_prod", SUBMISSIONS_TABLE):
+        if str(row.get("user_id")) != str(user_id):
+            continue
+        if str(row.get("week_start_date") or "")[:10] != week_start.isoformat():
+            continue
+        status = str(row.get("status") or "").strip().lower()
+        state = LOCKED_WEEK_STATUSES.get(status)
+        if state:
+            hint = " Unsubmit that week first." if status == "submitted" else ""
+            return (f"The week of {week_start.isoformat()} has been {state} "
+                    f"and is locked: {action}.{hint}")
+    return None
+
+
+def _check_entry_week_open(converted):
+    """
+    create_row("timetable", ...) - refuse to log into a locked week.
+
+    Rides on the cross_field_check hook rather than access_check, which
+    timetable already uses for its client restriction. Both run before
+    anything is written, which is all this needs.
+    """
+    return _week_lock_error(CURRENT_USER.get("user_id"), converted.get("date"),
+                            "no new entries can be added to it")
+
+
 RESOURCE_CONFIG = {
     "teams": {
         "schema": "ts_prod", "table": "teams", "min_scope_write": 3,
@@ -490,6 +565,7 @@ RESOURCE_CONFIG = {
         "foreign_keys": {"task_id": "tasks"},
         "datetime_fields": {"date"},
         "server_managed": _timetable_server_managed,
+        "cross_field_check": _check_entry_week_open,
         "access_check": _check_entry_client_access,
     },
 }
@@ -945,6 +1021,9 @@ def log_time_entry(
 ) -> dict:
     """
     Log a single time entry for the logged-in user.
+
+    Nothing can be logged into a week the user has already submitted or
+    that has been validated - that week is locked until it is unsubmitted.
     :param task_id: id of the task the time is logged against
     :param date: date and time in format DD-MM-YYYY HH:MM
     :param duration: duration in minutes
@@ -965,7 +1044,9 @@ def log_time_entries(entries_json: str) -> dict:
     """
     Log multiple time entries at once for the logged-in user, in a single
     API call instead of one log_time_entry call per line. Use this tool
-    only for 2 or more entries at once.
+    only for 2 or more entries at once. Entries falling in a submitted or
+    validated week are refused individually, like any other invalid entry -
+    the rest of the batch still goes through.
     :param entries_json: JSON array of objects, each with task_id, date
         (DD-MM-YYYY HH:MM), duration, internal_description,
         external_description
@@ -1008,7 +1089,9 @@ def update_time_entry(
     Update a time entry. Scope 1 can only update their own entries; scope
     2 and 3 can update any entry (same ownership rule as delete_entry).
     Only fields you provide are changed; entries that are already
-    approved can no longer be edited, regardless of scope.
+    approved can no longer be edited, regardless of scope. The same goes
+    for any entry in a submitted or validated week, and a new date may not
+    move an entry into such a week - unsubmit it first.
     :param entry_id: id of the timetable row to update
     :param task_id: new task_id, 0 = leave unchanged
     :param date: new date and time in format DD-MM-YYYY HH:MM, empty = leave unchanged
@@ -1027,6 +1110,10 @@ def update_time_entry(
         return {"success": False, "error": "You can only update your own entries."}
     if entry.get("approved"):
         return {"success": False, "error": "This entry is already approved and can no longer be updated."}
+    lock_error = _week_lock_error(entry.get("user_id"), entry.get("date"),
+                                 "this entry can no longer be changed")
+    if lock_error:
+        return {"success": False, "error": lock_error}
 
     config = RESOURCE_CONFIG["timetable"]
     raw_updates = {}
@@ -1051,6 +1138,13 @@ def update_time_entry(
             return {"success": False, "error": error}
         converted[field] = value
 
+    # Moving an entry is a write to BOTH weeks, so the target must be open too.
+    if "date" in converted:
+        lock_error = _week_lock_error(entry.get("user_id"), converted["date"],
+                                     "an entry cannot be moved into it")
+        if lock_error:
+            return {"success": False, "error": lock_error}
+
     check_task_id = converted.get("task_id", entry.get("task_id"))
     access_error = _check_entry_client_access({"task_id": check_task_id})
     if access_error:
@@ -1071,7 +1165,8 @@ def delete_entry(entry_id: int) -> dict:
     Delete a time entry. Scope 1 can only delete their own entries; scope
     2 and 3 can delete any entry. An entry that is already approved
     cannot be deleted by anyone, regardless of scope - same rule as
-    update_time_entry.
+    update_time_entry. Nor can an entry in a submitted or validated week,
+    which is locked until that week is unsubmitted.
     :param entry_id: id of the timetable row to delete
     """
     if not validate_positive_int(entry_id):
@@ -1087,6 +1182,11 @@ def delete_entry(entry_id: int) -> dict:
 
     if entry.get("approved"):
         return {"success": False, "error": "This entry is already approved and can no longer be deleted."}
+
+    lock_error = _week_lock_error(entry.get("user_id"), entry.get("date"),
+                                 "this entry can no longer be deleted")
+    if lock_error:
+        return {"success": False, "error": lock_error}
 
     dbconn.execute(DW_NAME, query=f"DELETE FROM ts_prod.timetable WHERE id = {entry_id}")
     _invalidate_timetable_caches()
