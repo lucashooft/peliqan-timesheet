@@ -227,6 +227,40 @@ Changes from v3.17:
     through the MCP reads (run_report_query) and nothing else: after this
     there is NO write path to ts_prod.timetable.approved here, at any
     scope. 21 tools.
+
+Changes from v3.18:
+  - create_client and create_project moved from scope 2+ to scope 1+:
+    RESOURCE_CONFIG["clients"]["min_scope_write"] and ["projects"][...] are
+    both 1 now. An employee can set up the client and project they need
+    without waiting on a manager.
+  - create_project is nevertheless limited for scope 1 to clients they are
+    assigned to, via a new _check_project_client_access registered as the
+    projects resource's access_check - the exact shape of
+    _check_task_client_access one level up. Scope 1 could otherwise attach
+    a project to any client in the account, including ones it cannot see.
+    create_client needs no such check: a brand-new client has no
+    assignments to violate, and the caller is given one immediately.
+  - create_client AUTO-ASSIGNS the caller to the client it just created,
+    via the same junction row add_user_to_client writes. Without it the
+    change above would be useless: _check_task_client_access gates logging
+    on that assignment, so a scope-1 user could create a client and then be
+    unable to log a single hour against anything under it. The result now
+    carries data.assigned_to_you, and a warning when the client was created
+    but the link was not.
+  - add_user_to_client and remove_user_from_client did NOT move. They used
+    to read their scope from RESOURCE_CONFIG["clients"]["min_scope_write"]
+    and would have followed it down to 1; they are now pinned to a separate
+    CLIENT_ASSIGN_SCOPE = 2. Creating a client and self-assigning is one
+    thing; handing another person access to it is still a manager decision.
+  - The junction INSERT moved out of add_user_to_client into
+    _link_user_to_client, so the internal relation name
+    (_pq_metadata._pq_rl_1339ee9e - see the v3.1 note, it changes if the
+    field is recreated) now appears in one place instead of two.
+  - Scope summary after this change: scope 1 creates clients, projects and
+    tasks, and logs/edits/deletes its own time. Scope 2+ adds validating
+    weeks (UI only), reading anyone's data via run_report_query, and
+    granting or revoking client access. Scope 3 keeps teams and user_roles.
+    Still 21 tools.
 """
 
 import json
@@ -269,6 +303,11 @@ MCP_TOOLS = []          # tool metadata sent to the client on tools/list
 TOOL_PERMISSIONS = {}    # tool_name -> minimum scope required
 TOOL_FUNCTIONS = {}      # tool_name -> function (only these are callable)
 CURRENT_USER = {}        # set per request by authenticate_user(), plain global dict
+
+# Deliberately NOT RESOURCE_CONFIG["clients"]["min_scope_write"], which is
+# now 1: anyone may create a client, but granting or revoking SOMEONE
+# ELSE'S access to one stays a manager decision.
+CLIENT_ASSIGN_SCOPE = 2
 
 
 def tool(min_scope: int = 1):
@@ -452,6 +491,22 @@ def _invalidate_timetable_caches():
     clear_cache("ts_prod", "timetable")
     clear_cache("ts_reporting", "fact_timetable")
 
+def _link_user_to_client(client_id: int, user_id: int) -> None:
+    """
+    Write the clients.user_list junction row and drop its cache.
+
+    Shared by add_user_to_client and by create_client's auto-assign, so the
+    raw-SQL relation name lives in exactly one place. Both ids are already
+    validated as positive integers by every caller, which is what keeps
+    this raw SQL non-injectable.
+    """
+    dbconn.execute(DW_NAME, query=(
+        f"INSERT INTO _pq_metadata._pq_rl_1339ee9e (source_table_id, target_table_id) "
+        f"VALUES ({int(client_id)}, {int(user_id)})"
+    ))
+    clear_cache("ts_prod", "_client_user_links")
+
+
 def _fetch_client_user_links():
     """
     Many-to-many fields (like clients.user_list) never come through
@@ -491,6 +546,21 @@ def _check_entry_client_access(converted):
     if not project or not _user_authorized_for_client(project.get("client_id"), CURRENT_USER["user_id"]):
         return "You are not authorized to log time for this client."
     return None
+
+def _check_project_client_access(converted):
+    """
+    Used by create_row("projects", ...). Scope 1 may create a project, but
+    only under a client they are actually on - the same clients they can
+    already see and log against. Without this, opening create_project to
+    scope 1 would let an employee attach a project to any client in the
+    account, including ones they have no visibility of.
+    """
+    if CURRENT_USER.get("scope", 0) >= 2:
+        return None  # only scope 1 is restricted
+    if not _user_authorized_for_client(converted.get("client_id"), CURRENT_USER["user_id"]):
+        return "You are not authorized to create projects for this client."
+    return None
+
 
 def _check_task_client_access(converted):
     """Used by create_row("tasks", ...) - only project_id exists yet, no task_id."""
@@ -582,18 +652,19 @@ RESOURCE_CONFIG = {
         "required": {"name"}, "unique": {"name"},
     },
     "clients": {
-        "schema": "ts_prod", "table": "clients", "min_scope_write": 2,
+        "schema": "ts_prod", "table": "clients", "min_scope_write": 1,
         "required": {"name", "peliqan_account_id"}, "optional": {"status"},
         "unique": {"name"}, "enums": {"status": CLIENT_STATUS},
         "defaults": {"status": "prospect"},
     },
     "projects": {
-        "schema": "ts_prod", "table": "projects", "min_scope_write": 2,
+        "schema": "ts_prod", "table": "projects", "min_scope_write": 1,
         "required": {"name", "client_id", "status", "start_date", "end_date"},
         "foreign_keys": {"client_id": "clients"},
         "enums": {"status": PROJECT_STATUS},
         "date_fields": {"start_date", "end_date"},
         "cross_field_check": _check_project_dates,
+        "access_check": _check_project_client_access,
     },
     "tasks": {
         "schema": "ts_prod", "table": "tasks", "min_scope_write": 1,
@@ -1245,20 +1316,47 @@ def delete_entry(entry_id: int) -> dict:
 @tool(min_scope=RESOURCE_CONFIG["clients"]["min_scope_write"])
 def create_client(name: str, peliqan_account_id: str, status: str = "prospect") -> dict:
     """
-    Create a new client.
+    Create a new client. Any scope may do this, and the caller is given
+    access to it automatically - without that, a scope-1 user could create
+    a client and then be unable to log a single hour against anything under
+    it, because _check_task_client_access filters on exactly that
+    assignment. Granting access to ANYONE ELSE remains scope 2+
+    (add_user_to_client).
     :param name: name of the client
     :param peliqan_account_id: Peliqan account id
     :param status: prospect, active, or churned
     """
-    return create_row("clients", {
+    result = create_row("clients", {
         "name": name, "peliqan_account_id": peliqan_account_id, "status": status,
     })
+    if not result.get("success"):
+        return result
+
+    client_id = (result.get("data") or {}).get("id")
+    user_id = CURRENT_USER.get("user_id")
+    assigned = False
+    if validate_positive_int(client_id) and validate_positive_int(user_id):
+        try:
+            _link_user_to_client(int(client_id), int(user_id))
+            assigned = True
+        except Exception:
+            # The client itself exists; say so rather than reporting a
+            # failure that would invite the caller to create it twice.
+            assigned = False
+    result["data"] = {**(result.get("data") or {}), "assigned_to_you": assigned}
+    if not assigned:
+        result["warning"] = ("The client was created but you were not assigned to "
+                             "it. Ask a manager to run add_user_to_client before "
+                             "logging time against it.")
+    return result
 
 
-@tool(min_scope=RESOURCE_CONFIG["clients"]["min_scope_write"])
+@tool(min_scope=CLIENT_ASSIGN_SCOPE)
 def add_user_to_client(client_id: int, user_id: int) -> dict:
     """
-    Give a user access to log time against a client's tasks.
+    Give a user access to log time against a client's tasks. Managers and
+    admins (scope 2+) only - creating a client self-assigns, but handing
+    access to someone else does not follow from being able to create one.
     :param client_id: id of the client
     :param user_id: id of the user (ts_prod.users.id) to grant access to
     """
@@ -1271,18 +1369,15 @@ def add_user_to_client(client_id: int, user_id: int) -> dict:
     if user_id in _fetch_client_user_links().get(client_id, set()):
         return {"success": False, "error": "This user already has access to this client."}
 
-    dbconn.execute(DW_NAME, query=(
-        f"INSERT INTO _pq_metadata._pq_rl_1339ee9e (source_table_id, target_table_id) "
-        f"VALUES ({client_id}, {user_id})"
-    ))
-    clear_cache("ts_prod", "_client_user_links")
+    _link_user_to_client(client_id, user_id)
     return {"success": True, "data": {"client_id": client_id, "user_id": user_id}}
 
 
-@tool(min_scope=RESOURCE_CONFIG["clients"]["min_scope_write"])
+@tool(min_scope=CLIENT_ASSIGN_SCOPE)
 def remove_user_from_client(client_id: int, user_id: int) -> dict:
     """
-    Remove a user's access to log time against a client's tasks.
+    Remove a user's access to log time against a client's tasks. Managers
+    and admins (scope 2+) only, matching add_user_to_client.
     :param client_id: id of the client
     :param user_id: id of the user (ts_prod.users.id) to remove access from
     """
@@ -1301,7 +1396,9 @@ def remove_user_from_client(client_id: int, user_id: int) -> dict:
 @tool(min_scope=RESOURCE_CONFIG["projects"]["min_scope_write"])
 def create_project(name: str, client_id: int, status: str, start_date: str, end_date: str) -> dict:
     """
-    Create a new project.
+    Create a new project under a client. Any scope may do this, but scope 1
+    is restricted to clients they are assigned to - the same clients they
+    can see and log against.
     :param name: name of the project
     :param client_id: id of the client this project belongs to
     :param status: planned, active, on_hold, or done
