@@ -98,6 +98,11 @@ S = "ts_prod"
 
 MANAGE_SCOPE = 2             # scope >= 2 can view anyone + validate
 
+# Task ids the viewer may log against, or None for "no restriction".
+# Reassigned once the viewer is known, below; the default keeps
+# task_selectbox working no matter when a dialog first runs.
+TASK_CHOICES = None
+
 DAY_TARGET_MIN = 8 * 60      # minimum per workday
 WORKDAYS = (0, 1, 2, 3, 4)
 DAY_ABBREV = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]
@@ -202,9 +207,46 @@ def load_task_lookup():
             "task": r.get("task") or f"Task {tid}",
             "project": r.get("project") or "-",
             "client": r.get("client") or "-",
+            "client_id": cid,
             "color": CLIENT_COLORS[cid % len(CLIENT_COLORS)],
         }
     return lookup
+
+
+# Deliberately unfiltered above: every task is needed to LABEL an entry,
+# including one logged against a client this viewer is not assigned to.
+# What a viewer may log against is a separate, narrower set - see
+# allowed_task_ids() and TASK_CHOICES.
+
+
+@st.cache_data(ttl=300)
+def load_client_links():
+    """
+    {client_id: {user_id, ...}} - who is assigned to which client.
+
+    clients.user_list is a many-to-many field and never comes through
+    dbconn.fetch(schema, table), so the only way to read it is the
+    internal junction table Peliqan itself queries for the relation.
+    Same read ts_mcp_server does in _fetch_client_user_links; keep the two
+    in step. NOTE: that internal name changes if the field is ever deleted
+    and recreated, so if this starts coming back empty, re-check clients'
+    user_list field metadata for its current relation id.
+    """
+    dbconn = pq.dbconnect(DW_NAME)
+    rows = dbconn.fetch(DW_NAME, query=(
+        "SELECT source_table_id, target_table_id "
+        "FROM _pq_metadata._pq_rl_1339ee9e")) or []
+    links = {}
+    for r in rows:
+        links.setdefault(to_int(r.get("source_table_id")),
+                         set()).add(to_int(r.get("target_table_id")))
+    return links
+
+
+def allowed_task_ids(lookup, links, user_id):
+    """The tasks `user_id` may log against: those of clients they are on."""
+    return {tid for tid, info in lookup.items()
+            if to_int(user_id) in links.get(info["client_id"], set())}
 
 
 @st.cache_data(ttl=60)
@@ -332,6 +374,18 @@ def task_selectbox(lookup, key, current=None):
     never saved just because nobody touched the box. Returns None while
     the placeholder is showing; callers gate their Save on that."""
     ids = sorted(lookup, key=lambda i: (lookup[i]["client"], lookup[i]["project"], lookup[i]["task"]))
+    if TASK_CHOICES is not None:
+        ids = [i for i in ids if i in TASK_CHOICES]
+    if not ids:
+        st.warning("You are not assigned to any client yet, so there is no task "
+                   "to log against. Ask an administrator to add you to one.")
+        return None
+    if current is not None and current not in ids:
+        # Same outcome as ts_mcp_server's update_time_entry, which re-checks
+        # client access against the entry's existing task: the entry cannot be
+        # saved as it stands, but re-pointing it at one of your own tasks works.
+        st.caption("This entry's task belongs to a client you are not assigned "
+                   "to. Pick one of your own tasks to save any change.")
     index = ids.index(current) if current in ids else None
     return st.selectbox("Task", ids, index=index, key=key,
                         placeholder="Choose a task...",
@@ -997,6 +1051,13 @@ if picked_day and monday_of(picked_day) != st.session_state.week_start:
 
 entries = load_entries(viewing_id)
 lookup = load_task_lookup()
+
+# Employees may only log against clients they are assigned to, exactly as
+# ts_mcp_server's _check_entry_client_access limits log_time_entry; managers
+# and admins may log against anything. Keyed on the VIEWED user, since that
+# is whose entry would be written - though only they can write it.
+TASK_CHOICES = None if can_manage else allowed_task_ids(
+    lookup, load_client_links(), viewing_id)
 submissions = load_submissions(viewing_id)
 
 week_start = st.session_state.week_start
