@@ -44,15 +44,15 @@
   "12011": {
     "filename": "12011_ts_my_week.py",
     "group": 3382,
-    "local_hash": "4737de4881dcd34d44d384296aaedd25f630d670e8ab5a2b8bb99cd905d37c3d",
+    "local_hash": "ebda33c24a237e775b439627e5169870f2e00dcc20f8028633d7f7621d626d02",
     "name": "ts_my_week",
-    "remote_hash": "4737de4881dcd34d44d384296aaedd25f630d670e8ab5a2b8bb99cd905d37c3d"
+    "remote_hash": "ebda33c24a237e775b439627e5169870f2e00dcc20f8028633d7f7621d626d02"
   },
   "12507": {
     "filename": "12507_ts_monthly_view.py",
     "group": 3382,
-    "local_hash": "0f710aee582d912e98475d69b51db1dd36c65fc3e5516562f88282651e261fd1",
+    "local_hash": "e5366afef6de57ecf213ec319de0e13372516ceaea62d8445a8ca1cef748e3b7",
     "name": "ts_monthly_view",
-    "remote_hash": "fdf063c0c65d14d1aa2a665ab48e66e48d2e38f8fe2c24f60faa8c1cd0041dcc"
+    "remote_hash": "4a99cc89098c88e0f8a3db75aec58e82849aa2dd7ac75b4ec2725d07f73cfc11"
   }
 }
