@@ -631,7 +631,15 @@ def task_selectbox(lookup, key, current=None):
         st.warning("You are not assigned to any client yet, so there is no task "
                    "to log against. Ask an administrator to add you to one.")
         return None
-    if current is not None and current not in ids:
+    if current is not None and current not in lookup:
+        # Not "not yours" - not known here at all. load_task_lookup is cached
+        # for 300s while load_entries is cached for 60s, so a task created on
+        # another surface (the MCP) can label its own entry "?" for the four
+        # minutes in between. Blaming client access there sends people to an
+        # administrator over a cache that is about to expire by itself.
+        st.caption("This task was created very recently and this page has not "
+                   "picked it up yet - it appears within a few minutes.")
+    elif current is not None and current not in ids:
         # Same outcome as ts_mcp_server's update_time_entry, which re-checks
         # client access against the entry's existing task: the entry cannot be
         # saved as it stands, but re-pointing it at one of your own tasks works.
@@ -1470,6 +1478,33 @@ if picked_day and monday_of(picked_day) != st.session_state.week_start:
 
 entries = load_entries(viewing_id)
 lookup = load_task_lookup()
+
+# A write from another surface - the MCP - is invisible here until this
+# app's caches expire, and they do not expire together: entries are cached
+# for 60s, tasks/projects/client links for 300s. Every .clear() elsewhere in
+# this file follows one of THIS app's own writes, so nothing here ever hears
+# about anyone else's. An entry whose task_id is missing from the lookup is
+# the only signal available that someone else has written, so treat it as
+# one: refresh the three slow caches and rerun. Otherwise the entry renders
+# as "?" and its task cannot be picked for the four minutes in between.
+#
+# Links and projects go too, not just tasks: a task new enough to be missing
+# usually arrives with a new project and client, and refreshing the lookup
+# alone would only move the entry from "?" to "not one of your clients".
+#
+# Once per id per session. An entry can also point at a task that is
+# genuinely gone, and that one never resolves - remembering which ids have
+# already been retried is what stops this rerunning forever.
+if not entries.empty:
+    retried = st.session_state.setdefault("refreshed_task_ids", set())
+    unknown = {t for t in (to_int(v) for v in entries["task_id"])
+               if t is not None and t not in lookup} - retried
+    if unknown:
+        retried |= unknown
+        load_task_lookup.clear()
+        load_client_links.clear()
+        load_projects.clear()
+        st.rerun()
 
 # Employees may only log against clients they are assigned to, exactly as
 # ts_mcp_server's _check_entry_client_access limits log_time_entry; managers
