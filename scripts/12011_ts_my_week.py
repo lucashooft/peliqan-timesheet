@@ -72,6 +72,7 @@ lifts that call into a system prepend that runs before this script body.
 import base64
 import hashlib
 import hmac
+import inspect
 import io
 import json
 import secrets
@@ -123,6 +124,17 @@ PROJECT_CHOICES = None
 
 SLOT_MIN = 15                # add-target granularity, in minutes
 SLOTS_PER_H = 60 // SLOT_MIN
+
+# Only reached by start_time_input's fallback - see there. st.time_input's
+# `step` decides which times are VALID, not merely which ones the menu lists,
+# so this is the coarsest step that still lets 13:42 be entered at all.
+START_STEP = timedelta(minutes=1)
+
+# Whether st.selectbox can take a value outside its options. Peliqan pins its
+# own Streamlit and this app cannot choose it, so ask rather than assume: on a
+# runtime without it, passing the argument is a TypeError that takes the whole
+# page down. Evaluated once, at import.
+CAN_TYPE_NEW_OPTIONS = "accept_new_options" in inspect.signature(st.selectbox).parameters
 
 GRID_START_H = 7             # default visible range; auto-extends to fit
 GRID_END_H = 19
@@ -619,6 +631,69 @@ def validate_week(user_id, week_start, validated_by_id, existing_submission):
 # Dialogs
 # =====================================================
 
+def parse_typed_time(text):
+    """
+    What someone might type into the start box -> a time, or None.
+
+    Deliberately forgiving about separators and about the leading zero,
+    because the fast way to enter 09:15 is "915" and being told that is not
+    a time would be absurd. "9" is 09:00; "1342", "13.42", "13h42" and
+    "13:42" are all 13:42.
+    """
+    raw = "".join(str(text).split())
+    for sep in (".", ",", ";", "h", "H", "u", "U"):
+        raw = raw.replace(sep, ":")
+    if raw.isdigit() and len(raw) > 2:          # 915 -> 9:15, 1342 -> 13:42
+        raw = f"{raw[:-2]}:{raw[-2:]}"
+    parts = raw.split(":")
+    try:
+        hour = int(parts[0])
+        minute = int(parts[1]) if len(parts) > 1 and parts[1] else 0
+    except (ValueError, IndexError):
+        return None
+    if len(parts) > 2 or not (0 <= hour < 24 and 0 <= minute < 60):
+        return None
+    return time(hour, minute)
+
+
+def start_time_input(container, value, key):
+    """
+    Start time: a quarter-hour menu that also accepts any minute typed.
+
+    st.time_input cannot do both. Its `step` sets which values are VALID,
+    not merely which ones the menu lists, so the step short enough to type
+    13:42 is also the one that makes the menu 1440 rows long. A selectbox
+    that accepts new options separates the two concerns: the menu stays at
+    SLOT_MIN, and anything typed is parsed instead of rejected.
+
+    An off-grid value is spliced into the options at its sorted position, so
+    an entry starting at 13:42 opens the menu on 13:42 rather than on
+    nothing - which is what used to send it back to midnight.
+
+    Where the runtime's Streamlit predates accept_new_options, falls back to
+    time_input at START_STEP: still typeable, just a longer menu.
+    """
+    value = (value or time(9, 0)).replace(second=0, microsecond=0)
+    if not CAN_TYPE_NEW_OPTIONS:
+        return container.time_input("Start", value=value, step=START_STEP, key=key)
+
+    current = value.strftime("%H:%M")
+    choices = sorted({f"{h:02d}:{m:02d}" for h in range(24)
+                      for m in range(0, 60, SLOT_MIN)} | {current})
+    picked = container.selectbox(
+        "Start", choices, index=choices.index(current), key=key,
+        accept_new_options=True,
+        help="Pick a quarter hour, or type any time - 13:42, 1342 and 13.42 all work",
+    )
+    typed = parse_typed_time(picked)
+    if typed is None:
+        # Keep the old value rather than guessing: a start time silently
+        # moved is worse than one that refused to move.
+        container.caption(f"\"{picked}\" is not a time - keeping {current}.")
+        return value
+    return typed
+
+
 def task_selectbox(lookup, key, current=None):
     """Task picker. Nothing preselected unless `current` names a live task -
     a new entry shows the placeholder, so the first task in the list is
@@ -793,7 +868,7 @@ def add_dialog(user_id, day, lookup, default_start=time(9, 0)):
 
     st.divider()
     c1, c2 = st.columns(2)
-    start = c1.time_input("Start", value=default_start, step=timedelta(minutes=15), key="add_start")
+    start = start_time_input(c1, default_start, "add_start_pick")
     dur = c2.number_input("Duration (min)", min_value=5, step=15, value=60, key="add_dur")
     note = st.text_area("Note", key="add_note", height=80)
 
@@ -840,8 +915,7 @@ def entry_dialog(entry, lookup, editable):
         task_id = task_selectbox(lookup, "edit_task", current=to_int(entry.get("task_id")))
         c1, c2, c3 = st.columns(3)
         new_day = c1.date_input("Day", value=dt.date(), key="edit_day")
-        new_start = c2.time_input("Start", value=dt.time().replace(second=0),
-                                  step=timedelta(minutes=15), key="edit_start")
+        new_start = start_time_input(c2, dt.time(), "edit_start_pick")
         new_dur = c3.number_input("Duration (min)", min_value=5, step=15,
                                   value=int(entry["duration"]), key="edit_dur")
         new_note = st.text_area("Note", value=entry.get("internal_description") or "",
