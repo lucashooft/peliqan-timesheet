@@ -174,7 +174,7 @@ def user_display_name(user):
 # Data loading (scoped SQL, cached)
 # =====================================================
 
-@st.cache_data(ttl=30)
+@st.cache_data(ttl=300)
 def load_users():
     dbconn = pq.dbconnect(DW_NAME)
     rows = dbconn.fetch(DW_NAME, S, "users") or []
@@ -199,7 +199,7 @@ def load_entries(user_id):
     return df.dropna(subset=["dt"]).sort_values("dt")
 
 
-@st.cache_data(ttl=30)
+@st.cache_data(ttl=300)
 def load_task_lookup():
     dbconn = pq.dbconnect(DW_NAME)
     rows = dbconn.fetch(DW_NAME, query=f"""
@@ -238,7 +238,7 @@ def load_task_lookup():
 # allowed_task_ids() and TASK_CHOICES.
 
 
-@st.cache_data(ttl=30)
+@st.cache_data(ttl=300)
 def load_client_links():
     """
     {client_id: {user_id, ...}} - who is assigned to which client.
@@ -262,7 +262,7 @@ def load_client_links():
     return links
 
 
-@st.cache_data(ttl=30)
+@st.cache_data(ttl=300)
 def load_projects():
     """{project_id: {name, client, client_id}} - targets for a new task."""
     dbconn = pq.dbconnect(DW_NAME)
