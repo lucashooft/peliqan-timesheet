@@ -1398,11 +1398,14 @@ user_ids = list(user_by_id.keys())
 # One row for everything at the top, bottom-aligned so the buttons sit on
 # the same baseline as the inputs beside them rather than level with their
 # labels. Weights sum to 10.0; gap_col is deliberately left empty,
-# separating the filters from the actions on the right. export_col is 2.0,
-# matching status_col in the header row below, so "Export to Excel" and
-# "Submit week" render at the same width.
+# separating the filters from the actions on the right.
+#
+# The last TWO weights are 2.0 each and the header row below ends with the
+# same pair, which is what stacks the four action buttons into an aligned
+# 2x2 block: Export over Validate, the account over Submit. Change one row
+# and you must change the other.
 view_col, week_col, gap_col, export_col, acct_col = st.columns(
-    [2.2, 1.6, 2.6, 2.0, 1.6], vertical_alignment="bottom")
+    [2.2, 1.6, 2.2, 2.0, 2.0], vertical_alignment="bottom")
 
 # The viewer is whoever logged in with Google - there is no other identity.
 viewer_id = LOGIN_USER_ID
@@ -1520,7 +1523,11 @@ if pending:
 
 # Weights sum to 10.0, matching the filter row above. title_col absorbs
 # whatever the buttons beside it do not use.
-prev_col, next_col, this_col, title_col, status_col = st.columns([1.15, 1.0, 1.0, 4.85, 2.0])
+# Ends with the same 2.0 + 2.0 pair as the filter row above, so Validate
+# lands under Export and Submit under the account. title_col gives up the
+# width that second column costs.
+prev_col, next_col, this_col, title_col, validate_col, submit_col = st.columns(
+    [1.15, 1.0, 1.0, 2.85, 2.0, 2.0])
 
 if prev_col.button("Previous week", key="prev_week", use_container_width=True):
     go_to_week(week_start - timedelta(days=7))
@@ -1539,24 +1546,26 @@ title_col.markdown(
     unsafe_allow_html=True,
 )
 
-with status_col:
-    if is_confirmed:
-        by = user_by_id.get(to_int((submission or {}).get("confirmed_by")))
-        st.success("Week validated" + (f" by {user_display_name(by)}" if by else ""))
-    elif wk_status == "submitted":
-        # No nested split: these fill status_col, so they come out the same
-        # width as "Submit week" in the other branch.
-        if can_validate and st.button("Validate", key="validate_btn", type="primary", use_container_width=True):
-            validate_dialog(viewing_user, week_start, viewer_id, submission)
-        if can_unsubmit and st.button("Unsubmit", key="unsubmit_btn", use_container_width=True):
-            unsubmit_week(viewing_id, week_start)
-            st.rerun()
-    else:
-        if can_edit:
-            if st.button("Submit week", key="submit_week_btn", type="primary", use_container_width=True):
-                submit_dialog(viewing_id, week_start, day_totals)
-        else:
-            st.caption("Week not submitted yet.")
+# Left column is always the validate action, right column always the
+# submit/unsubmit one, so a button never moves sideways as the week
+# changes state - it only appears or disappears.
+if is_confirmed:
+    by = user_by_id.get(to_int((submission or {}).get("confirmed_by")))
+    validate_col.success("Week validated" + (f" by {user_display_name(by)}" if by else ""))
+elif wk_status == "submitted":
+    if can_validate and validate_col.button("Validate", key="validate_btn",
+                                            type="primary", use_container_width=True):
+        validate_dialog(viewing_user, week_start, viewer_id, submission)
+    if can_unsubmit and submit_col.button("Unsubmit", key="unsubmit_btn",
+                                          use_container_width=True):
+        unsubmit_week(viewing_id, week_start)
+        st.rerun()
+elif can_edit:
+    if submit_col.button("Submit week", key="submit_week_btn",
+                         type="primary", use_container_width=True):
+        submit_dialog(viewing_id, week_start, day_totals)
+else:
+    submit_col.caption("Week not submitted yet.")
 
 # per-day 8h minimum summary (replaces the old weekly progress bar:
 # the target is a minimum of 8h per workday, not a 40h weekly pool)
