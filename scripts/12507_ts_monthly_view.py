@@ -76,10 +76,11 @@ def say(message):
 
 
 # =====================================================
-# Monthly export view
+# Monthly export view  (SHARED BLOCK - keep byte-identical with
+# ts_monthly_view / 12507_ts_monthly_view.py)
 #
-# Was duplicated into ts_my_week (12011), since two Data Apps cannot
-# import each other. That copy is gone: this is the only one left.
+# Two Data Apps cannot import each other, so this block is duplicated.
+# Edit it in one place and copy it to the other.
 #
 # One view per calendar month: ts_reporting.v_monthly_entries_2026_08 and
 # so on. The month window is baked into each view's SQL, so reading one
