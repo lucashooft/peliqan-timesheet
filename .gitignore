@@ -20,3 +20,5 @@ scripts/*.remote.py
 # OS cruft
 .DS_Store
 Thumbs.db
+
+timesheet_instructions.md
