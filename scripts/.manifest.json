@@ -23,9 +23,9 @@
   "11383": {
     "filename": "11383_ts_mcp_server.py",
     "group": 3382,
-    "local_hash": "075ff6d21d7d46f1d9fe428e67dc3398da8c0c1cd564a25fbd0e93f91fc755a6",
+    "local_hash": "b44cdf4a8b54b20b27330f5eed5c7101f5a29ed0f909e948640695c1f36549fc",
     "name": "ts_mcp_server",
-    "remote_hash": "f5be43cbdd0e8b520e2f85994917d02456e60a6cb6fc9955f5ba003b79de21d2"
+    "remote_hash": "36258976c8564e0754c1dbbfdd6b38ffc95615868577131fb05eaac21af26472"
   },
   "11954": {
     "filename": "11954_ts_bi_dashboard.py",
