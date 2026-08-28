@@ -990,6 +990,29 @@ def export_dialog(can_manage, user_ids, user_by_id, default_month):
     )
 
 
+# Every keyed widget inside each dialog. A dialog reruns as a fragment, so
+# these outlive the dialog being dismissed and would otherwise be reused the
+# next time it opens - showing the last thing typed instead of what is
+# stored. Keep in step with the widgets themselves.
+ADD_KEYS = ("add_task", "add_start_pick", "add_dur", "add_note",
+            "add_new_project", "add_new_status", "add_new_name",
+            "add_new_billable", "add_new_desc")
+EDIT_KEYS = ("edit_task", "edit_day", "edit_start_pick", "edit_dur", "edit_note")
+
+
+def reset_dialog_state(keys):
+    """
+    Drop a dialog's leftover widget state so the next opening starts from
+    the stored values.
+
+    Call this immediately BEFORE opening a dialog, never inside one:
+    Streamlit refuses to let a widget's key be changed once that widget has
+    been instantiated in the current run.
+    """
+    for key in keys:
+        st.session_state.pop(key, None)
+
+
 @st.dialog("New entry")
 def add_dialog(user_id, day, lookup, default_start=time(9, 0)):
     st.caption(day.strftime("%A %d %B %Y"))
@@ -1773,11 +1796,13 @@ if pending:
         match = entries[entries["id"].astype(str) == str(pending[1])]
         if not match.empty:
             e = match.iloc[0].to_dict()
+            reset_dialog_state(EDIT_KEYS)
             entry_dialog(e, lookup, editable=can_edit and not is_true(e.get("approved")),
                          user_id=viewing_id)
     elif kind == "add" and can_edit:
         # len check: a pending queued before slots existed carries no minute
         minute = pending[3] if len(pending) > 3 else 0
+        reset_dialog_state(ADD_KEYS)
         add_dialog(viewing_id, pending[1], lookup,
                    default_start=time(pending[2], minute))
 
@@ -1861,6 +1886,7 @@ for i, d in enumerate(days):
             if st.button("Add an entry", key=f"add_day_{d.isoformat()}",
                          help=f"Add an entry on {d.strftime('%a %d %b')}",
                          use_container_width=True):
+                reset_dialog_state(ADD_KEYS)
                 add_dialog(viewing_id, d, lookup)
         
 
@@ -2004,6 +2030,7 @@ if untimed:
         lock = " (locked)" if is_true(e.get("approved")) else ""
         lbl = f"{e['dt'].strftime('%a %d')} - {fmt_dur(e['duration'])} - {info['client']}{lock}"
         if u_cols[j % len(u_cols)].button(lbl, key=f"u_{e['id']}", use_container_width=True):
+            reset_dialog_state(EDIT_KEYS)
             entry_dialog(e, lookup, editable=can_edit and not is_true(e.get("approved")),
                          user_id=viewing_id)
 
