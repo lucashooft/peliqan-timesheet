@@ -150,6 +150,14 @@ SLOTS_PER_H = 60 // SLOT_MIN
 # so this is the coarsest step that still lets 13:42 be entered at all.
 START_STEP = timedelta(minutes=1)
 
+# The quarter hours the start menu offers: 06:00 up to and including 19:45.
+# Nobody scrolls past midnight to find 09:00, and the hours outside this are
+# rare enough to be worth typing. They are NOT forbidden - anything typed is
+# still accepted, and an entry that already starts outside the range keeps
+# its own time in the list so the menu opens on it.
+MENU_FROM_H = 6
+MENU_TO_H = 20
+
 # Whether st.selectbox can take a value outside its options. Peliqan pins its
 # own Streamlit and this app cannot choose it, so ask rather than assume: on a
 # runtime without it, passing the argument is a TypeError that takes the whole
@@ -803,9 +811,11 @@ def start_time_input(container, value, key):
     that accepts new options separates the two concerns: the menu stays at
     SLOT_MIN, and anything typed is parsed instead of rejected.
 
-    An off-grid value is spliced into the options at its sorted position, so
-    an entry starting at 13:42 opens the menu on 13:42 rather than on
-    nothing - which is what used to send it back to midnight.
+    The menu lists MENU_FROM_H to MENU_TO_H only. A value outside that - an
+    early start, or a minute off the quarter hour like 13:42 - is spliced
+    into the options at its sorted position, so the menu still opens on the
+    entry's own time instead of on nothing, which is what used to send it
+    back to midnight.
 
     Where the runtime's Streamlit predates accept_new_options, falls back to
     time_input at START_STEP: still typeable, just a longer menu.
@@ -815,12 +825,15 @@ def start_time_input(container, value, key):
         return container.time_input("Start", value=value, step=START_STEP, key=key)
 
     current = value.strftime("%H:%M")
-    choices = sorted({f"{h:02d}:{m:02d}" for h in range(24)
+    choices = sorted({f"{h:02d}:{m:02d}"
+                      for h in range(MENU_FROM_H, MENU_TO_H)
                       for m in range(0, 60, SLOT_MIN)} | {current})
     picked = container.selectbox(
         "Start", choices, index=choices.index(current), key=key,
         accept_new_options=True,
-        help="Pick a quarter hour, or type any time - 13:42, 1342 and 13.42 all work",
+        help=(f"Pick a quarter hour between {MENU_FROM_H:02d}:00 and "
+              f"{MENU_TO_H - 1:02d}:45, or type any time at all - 13:42, "
+              f"1342 and 13.42 all work, and so does 05:30."),
     )
     typed = parse_typed_time(picked)
     if typed is None:
