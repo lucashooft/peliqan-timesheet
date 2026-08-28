@@ -890,16 +890,16 @@ def new_task_fields(projects):
 
     c1, c2 = st.columns([2, 1])
     project_id = c1.selectbox(
-        "Project", ids, index=None, key="add_new_project",
+        "Project", ids, index=None, key=dialog_key("add_new_project"),
         placeholder="Choose a project...",
         format_func=lambda i: f"{projects[i]['client']} - {projects[i]['project']}")
     status = c2.selectbox("Status", TASK_STATUSES,
                           index=TASK_STATUSES.index(NEW_TASK_STATUS),
-                          key="add_new_status")
-    name = st.text_input("Task name", key="add_new_name",
+                          key=dialog_key("add_new_status"))
+    name = st.text_input("Task name", key=dialog_key("add_new_name"),
                          placeholder="What is this task called?")
-    billable = st.checkbox("Billable", value=NEW_TASK_BILLABLE, key="add_new_billable")
-    description = st.text_area("Description", key="add_new_desc", height=68,
+    billable = st.checkbox("Billable", value=NEW_TASK_BILLABLE, key=dialog_key("add_new_billable"))
+    description = st.text_area("Description", key=dialog_key("add_new_desc"), height=68,
                                placeholder="Optional")
     return {"project_id": project_id, "status": status, "name": name,
             "billable": billable, "description": description}
@@ -990,33 +990,34 @@ def export_dialog(can_manage, user_ids, user_by_id, default_month):
     )
 
 
-# Every keyed widget inside each dialog. A dialog reruns as a fragment, so
-# these outlive the dialog being dismissed and would otherwise be reused the
-# next time it opens - showing the last thing typed instead of what is
-# stored. Keep in step with the widgets themselves.
-ADD_KEYS = ("add_task", "add_start_pick", "add_dur", "add_note",
-            "add_new_project", "add_new_status", "add_new_name",
-            "add_new_billable", "add_new_desc")
-EDIT_KEYS = ("edit_task", "edit_day", "edit_start_pick", "edit_dur", "edit_note")
-
-
-def reset_dialog_state(keys):
+def dialog_key(name):
     """
-    Drop a dialog's leftover widget state so the next opening starts from
-    the stored values.
+    A widget key belonging to the CURRENT opening of a dialog.
 
-    Call this immediately BEFORE opening a dialog, never inside one:
-    Streamlit refuses to let a widget's key be changed once that widget has
-    been instantiated in the current run.
+    Clearing a key out of session_state does not reset a widget: the browser
+    still holds it and sends its value back with the next rerun, so
+    Streamlit restores that value before `value=` or `index=` is consulted.
+    A key that changes sidesteps it - the widget is a different one, with no
+    history to restore, so it takes the default it is given. Same trick as
+    the week picker and the calendar chart further down this file.
     """
-    for key in keys:
-        st.session_state.pop(key, None)
+    return f"{name}_{st.session_state.get('dialog_token', 0)}"
+
+
+def open_dialog():
+    """
+    Retire the previous opening's widgets. Call immediately BEFORE opening
+    any dialog, never inside one - during a dialog's own fragment reruns the
+    token has to stay put, or every keystroke would rebuild the form and
+    throw away what is being typed.
+    """
+    st.session_state.dialog_token = st.session_state.get("dialog_token", 0) + 1
 
 
 @st.dialog("New entry")
 def add_dialog(user_id, day, lookup, default_start=time(9, 0)):
     st.caption(day.strftime("%A %d %B %Y"))
-    task_id = task_selectbox(lookup, "add_task")
+    task_id = task_selectbox(lookup, dialog_key("add_task"))
 
     # Picked a task: show what it is. Picked nothing: offer to create one.
     new_task = None
@@ -1028,9 +1029,9 @@ def add_dialog(user_id, day, lookup, default_start=time(9, 0)):
 
     st.divider()
     c1, c2 = st.columns(2)
-    start = start_time_input(c1, default_start, "add_start_pick")
-    dur = c2.number_input("Duration (min)", min_value=5, step=15, value=60, key="add_dur")
-    note = st.text_area("Note", key="add_note", height=80)
+    start = start_time_input(c1, default_start, dialog_key("add_start_pick"))
+    dur = c2.number_input("Duration (min)", min_value=5, step=15, value=60, key=dialog_key("add_dur"))
+    note = st.text_area("Note", key=dialog_key("add_note"), height=80)
 
     ready = task_id is not None or bool(
         new_task and new_task["project_id"] is not None and new_task["name"].strip())
@@ -1078,14 +1079,14 @@ def entry_dialog(entry, lookup, editable, user_id):
         return
 
     with st.form("edit_form", border=False):
-        task_id = task_selectbox(lookup, "edit_task", current=to_int(entry.get("task_id")))
+        task_id = task_selectbox(lookup, dialog_key("edit_task"), current=to_int(entry.get("task_id")))
         c1, c2, c3 = st.columns(3)
-        new_day = c1.date_input("Day", value=dt.date(), key="edit_day")
-        new_start = start_time_input(c2, dt.time(), "edit_start_pick")
+        new_day = c1.date_input("Day", value=dt.date(), key=dialog_key("edit_day"))
+        new_start = start_time_input(c2, dt.time(), dialog_key("edit_start_pick"))
         new_dur = c3.number_input("Duration (min)", min_value=5, step=15,
-                                  value=int(entry["duration"]), key="edit_dur")
+                                  value=int(entry["duration"]), key=dialog_key("edit_dur"))
         new_note = st.text_area("Note", value=entry.get("internal_description") or "",
-                                key="edit_note", height=80)
+                                key=dialog_key("edit_note"), height=80)
         s1, s2 = st.columns(2)
         if s1.form_submit_button("Save", type="primary", use_container_width=True,
                                  disabled=task_id is None):
@@ -1796,13 +1797,13 @@ if pending:
         match = entries[entries["id"].astype(str) == str(pending[1])]
         if not match.empty:
             e = match.iloc[0].to_dict()
-            reset_dialog_state(EDIT_KEYS)
+            open_dialog()
             entry_dialog(e, lookup, editable=can_edit and not is_true(e.get("approved")),
                          user_id=viewing_id)
     elif kind == "add" and can_edit:
         # len check: a pending queued before slots existed carries no minute
         minute = pending[3] if len(pending) > 3 else 0
-        reset_dialog_state(ADD_KEYS)
+        open_dialog()
         add_dialog(viewing_id, pending[1], lookup,
                    default_start=time(pending[2], minute))
 
@@ -1886,7 +1887,7 @@ for i, d in enumerate(days):
             if st.button("Add an entry", key=f"add_day_{d.isoformat()}",
                          help=f"Add an entry on {d.strftime('%a %d %b')}",
                          use_container_width=True):
-                reset_dialog_state(ADD_KEYS)
+                open_dialog()
                 add_dialog(viewing_id, d, lookup)
         
 
@@ -2030,7 +2031,7 @@ if untimed:
         lock = " (locked)" if is_true(e.get("approved")) else ""
         lbl = f"{e['dt'].strftime('%a %d')} - {fmt_dur(e['duration'])} - {info['client']}{lock}"
         if u_cols[j % len(u_cols)].button(lbl, key=f"u_{e['id']}", use_container_width=True):
-            reset_dialog_state(EDIT_KEYS)
+            open_dialog()
             entry_dialog(e, lookup, editable=can_edit and not is_true(e.get("approved")),
                          user_id=viewing_id)
 
