@@ -261,6 +261,36 @@ Changes from v3.18:
     weeks (UI only), reading anyone's data via run_report_query, and
     granting or revoking client access. Scope 3 keeps teams and user_roles.
     Still 21 tools.
+
+Changes from v3.19:
+  - Time entries may no longer OVERLAP each other. Enforced on create
+    through the timetable's cross_field_check (_check_entry_cross_fields
+    chains the week-lock rule and _check_entry_overlap, since create_row
+    offers only one such hook) and again inside update_time_entry, which
+    does not go through create_row. Half-open comparison, so entries may
+    sit back to back: one ending at 10:30 and one starting at 10:30 are
+    both fine. Reads ts_prod.timetable and never fact_timetable, which
+    lags. This shipped without a changelog entry; recorded here.
+  - ts_my_week enforces the same rule independently, since Data Apps cannot
+    import each other. Keep _overlap_error and its conflicting_entry in
+    step.
+
+Changes from v3.20:
+  - Added create_user, scope 3. There was previously no write path to
+    ts_prod.users from here at all, so onboarding meant the users screen or
+    the warehouse by hand. A row in that table is what grants access - both
+    gated surfaces resolve a Google account to one by email - so this is an
+    admin tool and email is declared unique: authenticate_user takes the
+    first case-insensitive match, and a duplicate would silently decide
+    someone's scope.
+  - create_user always writes a scope, defaulting to 1. ts_users_UI creates
+    rows without one and authenticate_user reads `scope or 0`, so those
+    users can sign in nowhere until the column is set by hand.
+  - Scope summary after this change: scope 1 creates clients, projects and
+    tasks, and logs/edits/deletes its own time. Scope 2+ adds validating
+    weeks (UI only), reading anyone's data via run_report_query, and
+    granting or revoking client access. Scope 3 keeps teams, user_roles and
+    now users. 22 tools.
 """
 
 import json
@@ -730,6 +760,17 @@ def _check_entry_cross_fields(converted):
 
 
 RESOURCE_CONFIG = {
+    "users": {
+        # A row here is what lets somebody sign in at all, which is why the
+        # write scope is 3 and why email is unique: authenticate_user takes
+        # the first case-insensitive match, so a second row with the same
+        # address would quietly decide that person's scope.
+        "schema": "ts_prod", "table": "users", "min_scope_write": 3,
+        "required": {"name", "email"},
+        "optional": {"scope", "role_id", "team_id"},
+        "foreign_keys": {"role_id": "user_roles", "team_id": "teams"},
+        "unique": {"email"},
+    },
     "teams": {
         "schema": "ts_prod", "table": "teams", "min_scope_write": 3,
         "required": {"name"}, "unique": {"name"},
@@ -1567,6 +1608,46 @@ def create_tasks(tasks_json: str) -> dict:
         "failed": len(results) - success_count,
         "results": results,
     }
+
+
+@tool(min_scope=RESOURCE_CONFIG["users"]["min_scope_write"])
+def create_user(name: str, email: str, scope: int = 1,
+                role_id: int = 0, team_id: int = 0) -> dict:
+    """
+    Create a user. Admins only, because this IS the grant of access: both
+    the timesheet calendar and this server resolve a Google account to a
+    ts_prod.users row by email, so a new row lets that person sign in and
+    `scope` decides how far they get - 1 employee, 2 manager, 3 admin,
+    cumulative. Nothing else gates them.
+
+    The email must be the Google account they will actually sign in with;
+    it is matched case-insensitively and must not already be in use.
+
+    A scope is always written. The users screen creates rows without one,
+    and a user with no scope can sign in nowhere.
+    :param name: the person's name as it should appear in the timesheet
+    :param email: the Google account they will sign in with
+    :param scope: 1 employee, 2 manager, 3 admin. Defaults to 1
+    :param role_id: id from get_user_roles, 0 = leave unset
+    :param team_id: id from get_teams, 0 = leave unset
+    """
+    if scope not in (1, 2, 3):
+        return {"success": False,
+                "error": "scope must be 1 (employee), 2 (manager) or 3 (admin)."}
+
+    address = str(email).strip()
+    if "@" not in address or len(address.split()) != 1:
+        return {"success": False,
+                "error": "email must be a single address, like name@peliqan.io."}
+
+    # 0 means "not given" for the optional links; passing it through would
+    # fail foreign-key validation, which only accepts positive integers.
+    data = {"name": name, "email": address, "scope": scope}
+    if role_id:
+        data["role_id"] = role_id
+    if team_id:
+        data["team_id"] = team_id
+    return create_row("users", data)
 
 
 @tool(min_scope=RESOURCE_CONFIG["teams"]["min_scope_write"])
