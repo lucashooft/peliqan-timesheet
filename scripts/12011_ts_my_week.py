@@ -145,11 +145,6 @@ PROJECT_CHOICES = None
 SLOT_MIN = 15                # add-target granularity, in minutes
 SLOTS_PER_H = 60 // SLOT_MIN
 
-# Only reached by start_time_input's fallback - see there. st.time_input's
-# `step` decides which times are VALID, not merely which ones the menu lists,
-# so this is the coarsest step that still lets 13:42 be entered at all.
-START_STEP = timedelta(minutes=1)
-
 # The quarter hours the start menu offers: 06:00 up to and including 19:45.
 # Nobody scrolls past midnight to find 09:00, and the hours outside this are
 # rare enough to be worth typing. They are NOT forbidden - anything typed is
@@ -803,38 +798,44 @@ def parse_typed_time(text):
 
 def start_time_input(container, value, key):
     """
-    Start time: a quarter-hour menu that also accepts any minute typed.
+    Start time: a quarter-hour menu that also accepts any minute.
 
-    st.time_input cannot do both. Its `step` sets which values are VALID,
-    not merely which ones the menu lists, so the step short enough to type
-    13:42 is also the one that makes the menu 1440 rows long. A selectbox
-    that accepts new options separates the two concerns: the menu stays at
-    SLOT_MIN, and anything typed is parsed instead of rejected.
+    Always a selectbox, never st.time_input. time_input's `step` decides
+    which values are VALID rather than merely which ones the menu lists, so
+    the step short enough to accept 13:42 also makes the menu 1440 rows
+    long - and a list that long opens at the top instead of on the entry's
+    own time, which was the entire complaint.
 
     The menu lists MENU_FROM_H to MENU_TO_H only. A value outside that - an
     early start, or a minute off the quarter hour like 13:42 - is spliced
     into the options at its sorted position, so the menu still opens on the
-    entry's own time instead of on nothing, which is what used to send it
-    back to midnight.
+    entry's own time rather than on nothing.
 
-    Where the runtime's Streamlit predates accept_new_options, falls back to
-    time_input at START_STEP: still typeable, just a longer menu.
+    Typing an exact time into the same box needs accept_new_options, which
+    older Streamlit lacks. There a second small field takes it instead, so
+    every runtime gets a short menu that lands on the value; only the way
+    you enter an unusual time differs.
     """
     value = (value or time(9, 0)).replace(second=0, microsecond=0)
-    if not CAN_TYPE_NEW_OPTIONS:
-        return container.time_input("Start", value=value, step=START_STEP, key=key)
-
     current = value.strftime("%H:%M")
     choices = sorted({f"{h:02d}:{m:02d}"
                       for h in range(MENU_FROM_H, MENU_TO_H)
                       for m in range(0, 60, SLOT_MIN)} | {current})
+    hint = (f"Pick a quarter hour between {MENU_FROM_H:02d}:00 and "
+            f"{MENU_TO_H - 1:02d}:45, or type any time at all - 13:42, "
+            f"1342 and 13.42 all work, and so does 05:30.")
     picked = container.selectbox(
-        "Start", choices, index=choices.index(current), key=key,
-        accept_new_options=True,
-        help=(f"Pick a quarter hour between {MENU_FROM_H:02d}:00 and "
-              f"{MENU_TO_H - 1:02d}:45, or type any time at all - 13:42, "
-              f"1342 and 13.42 all work, and so does 05:30."),
+        "Start", choices, index=choices.index(current), key=key, help=hint,
+        **({"accept_new_options": True} if CAN_TYPE_NEW_OPTIONS else {}),
     )
+    if not CAN_TYPE_NEW_OPTIONS:
+        # This runtime's selectbox takes no free text, so an exact time needs
+        # somewhere else to go. Empty means "use the menu".
+        other = container.text_input(
+            "Start (exact)", value="", key=f"{key}_typed", placeholder="or type 13:42",
+            label_visibility="collapsed", help=hint)
+        if other.strip():
+            picked = other
     typed = parse_typed_time(picked)
     if typed is None:
         # Keep the old value rather than guessing: a start time silently
@@ -1017,6 +1018,29 @@ def dialog_key(name):
     return f"{name}_{st.session_state.get('dialog_token', 0)}"
 
 
+def seeded_key(name, value):
+    """
+    A STABLE widget key, reset once per dialog opening.
+
+    Same result as dialog_key without rebuilding the widget: writing
+    session_state before a widget is instantiated sets the value it opens
+    with. Wanted for the date input specifically, because a remounted date
+    input can take focus and focus opens its calendar - which is why one
+    would pop open by itself, on the same entry, only sometimes.
+
+    Seeded once per opening rather than on every rerun, or the day could
+    never be changed: each keystroke elsewhere in the dialog would put it
+    back. Do not pass `value=` to a widget keyed this way; Streamlit warns
+    when a default and a session_state value are both supplied.
+    """
+    token = st.session_state.get("dialog_token", 0)
+    stamp = f"{name}__seeded_for"
+    if st.session_state.get(stamp) != token:
+        st.session_state[name] = value
+        st.session_state[stamp] = token
+    return name
+
+
 def open_dialog():
     """
     Retire the previous opening's widgets. Call immediately BEFORE opening
@@ -1094,7 +1118,7 @@ def entry_dialog(entry, lookup, editable, user_id):
     with st.form("edit_form", border=False):
         task_id = task_selectbox(lookup, dialog_key("edit_task"), current=to_int(entry.get("task_id")))
         c1, c2, c3 = st.columns(3)
-        new_day = c1.date_input("Day", value=dt.date(), key=dialog_key("edit_day"))
+        new_day = c1.date_input("Day", key=seeded_key("edit_day", dt.date()))
         new_start = start_time_input(c2, dt.time(), dialog_key("edit_start_pick"))
         new_dur = c3.number_input("Duration (min)", min_value=5, step=15,
                                   value=int(entry["duration"]), key=dialog_key("edit_dur"))
