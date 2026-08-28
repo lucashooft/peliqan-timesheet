@@ -44,9 +44,9 @@
   "12011": {
     "filename": "12011_ts_my_week.py",
     "group": 3382,
-    "local_hash": "801c0b0b856906ac58d08c0d28a63b6152a896c34e1e2a28946c87df70389964",
+    "local_hash": "0fe023ed30403fb7bb22f1e1ec3c7d70c7e791d2a731c4f4625524fed8ab0882",
     "name": "ts_my_week",
-    "remote_hash": "ae582d10a16c552fe4dfc69848fffb72a1cc6315562d2fb0991e722c954222a5"
+    "remote_hash": "9280b46fce0ccb92f7ccf19d1b1f7565a620175ee97d812074d7fbad98b3a1ac"
   },
   "12507": {
     "filename": "12507_ts_monthly_view.py",
