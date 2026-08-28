@@ -549,7 +549,106 @@ def duplicate_task(lookup, project_id, name):
                for info in lookup.values())
 
 
+def entry_bounds(row):
+    """
+    (start, end) for a row holding `dt` and `duration`, or None.
+
+    An entry with no start time cannot overlap anything - the grid lists
+    those under the calendar rather than in it - so it is skipped instead of
+    being treated as midnight, which would pile them all up at 00:00.
+    """
+    start = row.get("dt")
+    if start is None or pd.isna(start):
+        return None
+    minutes = to_int(row.get("duration")) or 0
+    if minutes <= 0:
+        return None
+    if hasattr(start, "to_pydatetime"):
+        start = start.to_pydatetime()
+    return start, start + timedelta(minutes=minutes)
+
+
+def conflicting_entry(rows, entry_dt, duration_minutes, exclude_id=None):
+    """
+    The row this entry would double-book, as (row, start, end), or None.
+
+    Half-open on purpose: an entry ending at 10:30 and one starting at 10:30
+    touch but do not overlap, which is what an ordinary back-to-back day
+    looks like. Comparing inclusively would reject most real days.
+
+    Pass exclude_id when editing, or the entry being changed is found as its
+    own clash and can never be saved.
+
+    `rows` must already be ONE user's entries: both callers hand it rows
+    filtered by user_id in SQL. The matching rule in ts_mcp_server
+    (_overlap_error) filters internally instead, so if you ever feed this
+    something wider, filter first - a colleague's entry is not a clash.
+    """
+    minutes = to_int(duration_minutes) or 0
+    if minutes <= 0:
+        return None
+    new_end = entry_dt + timedelta(minutes=minutes)
+    for row in rows:
+        if exclude_id is not None and to_int(row.get("id")) == to_int(exclude_id):
+            continue
+        bounds = entry_bounds(row)
+        if bounds is None:
+            continue
+        start, end = bounds
+        if entry_dt < end and start < new_end:
+            return row, start, end
+    return None
+
+
+def overlap_message(conflict, lookup):
+    """Name the entry in the way, not just the fact of it."""
+    row, start, end = conflict
+    info = lookup.get(to_int(row.get("task_id")), LOOKUP_DEFAULT)
+    return (f"That overlaps **{info['task']}** on {start.strftime('%a %d %b')}, "
+            f"{start.strftime('%H:%M')} to {end.strftime('%H:%M')}. Entries can "
+            f"sit back to back, but not on top of each other.")
+
+
+def neighbour_rows(user_id, day):
+    """
+    The user's entries around `day`, read straight from the table.
+
+    Not load_entries: that is cached for 60s and only cleared by this app's
+    own writes, so an entry logged through the MCP a minute ago would be
+    invisible and the overlap waved through. A save is rare enough to afford
+    its own read.
+
+    A day either side is included because an entry can run past midnight,
+    and the neighbour it would collide with then carries the next date.
+    """
+    dbconn = pq.dbconnect(DW_NAME)
+    lo = (day - timedelta(days=1)).isoformat()
+    hi = (day + timedelta(days=2)).isoformat()
+    rows = dbconn.fetch(DW_NAME, query=f"""
+        SELECT id, task_id, date, duration
+        FROM {S}.timetable
+        WHERE user_id::text = '{int(user_id)}'
+          AND date >= '{lo}' AND date < '{hi}'
+    """) or []
+    out = []
+    for r in rows:
+        dt = pd.to_datetime(r.get("date"), errors="coerce")
+        if pd.isna(dt):
+            continue
+        out.append({"id": to_int(r.get("id")), "task_id": to_int(r.get("task_id")),
+                    "dt": dt, "duration": to_int(r.get("duration")) or 0})
+    return out
+
+
 def insert_entry(user_id, task_id, entry_dt, duration_minutes, note):
+    """Write the entry, or return why it was refused. The write boundary
+    re-checks even when the dialog already did: this is the last point
+    before the row lands."""
+    conflict = conflicting_entry(neighbour_rows(user_id, entry_dt.date()),
+                                 entry_dt, duration_minutes)
+    if conflict:
+        return overlap_message(conflict, load_task_lookup())
+
     dbconn = pq.dbconnect(DW_NAME)
     dbconn.insert(DW_NAME, S, "timetable", {
         "user_id": int(user_id),
@@ -563,9 +662,26 @@ def insert_entry(user_id, task_id, entry_dt, duration_minutes, note):
         "approved_by": None,
     })
     load_entries.clear()
+    return None
 
 
-def update_entry(entry_id, task_id, entry_dt, duration_minutes, note):
+def update_entry(entry_id, user_id, task_id, entry_dt, duration_minutes, note,
+                 check_overlap=True):
+    """
+    Write the change, or return why it was refused.
+
+    check_overlap is False when only the task or the note changed: entries
+    written before this rule existed may already sit on top of each other,
+    and refusing to let someone retitle one would punish them for a clash
+    they did not make. Only a move is checked.
+    """
+    if check_overlap:
+        conflict = conflicting_entry(neighbour_rows(user_id, entry_dt.date()),
+                                     entry_dt, duration_minutes,
+                                     exclude_id=entry_id)
+        if conflict:
+            return overlap_message(conflict, load_task_lookup())
+
     dbconn = pq.dbconnect(DW_NAME)
     dbconn.update(DW_NAME, S, "timetable", int(entry_id), {
         "task_id": int(task_id),
@@ -574,6 +690,7 @@ def update_entry(entry_id, task_id, entry_dt, duration_minutes, note):
         "internal_description": (note or "").strip(),
     })
     load_entries.clear()
+    return None
 
 
 def delete_entry(entry_id):
@@ -897,8 +1014,13 @@ def add_dialog(user_id, day, lookup, default_start=time(9, 0)):
     label = "Save" if task_id is not None else "Create task and save"
     if st.button(label, type="primary", use_container_width=True, key="add_save",
                  disabled=not ready):
-        error = None
-        if task_id is None:
+        entry_dt = datetime.combine(day, start)
+        # The slot is checked FIRST, before any task is created: a refused
+        # save must not leave a new task behind for a row that never landed.
+        conflict = conflicting_entry(neighbour_rows(user_id, day), entry_dt, dur)
+        error = overlap_message(conflict, lookup) if conflict else None
+
+        if not error and task_id is None:
             if duplicate_task(lookup, new_task["project_id"], new_task["name"]):
                 error = ("That project already has a task with this name. "
                          "Pick it from the list above instead.")
@@ -906,15 +1028,16 @@ def add_dialog(user_id, day, lookup, default_start=time(9, 0)):
                 task_id, error = create_task(
                     new_task["name"], new_task["project_id"], new_task["status"],
                     new_task["billable"], new_task["description"])
+        if not error:
+            error = insert_entry(user_id, task_id, entry_dt, dur, note)
         if error:
             st.error(error)
         else:
-            insert_entry(user_id, task_id, datetime.combine(day, start), dur, note)
             st.rerun()
 
 
 @st.dialog("Entry")
-def entry_dialog(entry, lookup, editable):
+def entry_dialog(entry, lookup, editable, user_id):
     info = lookup.get(to_int(entry.get("task_id")), LOOKUP_DEFAULT)
     dt = entry["dt"]
     st.markdown(
@@ -943,8 +1066,19 @@ def entry_dialog(entry, lookup, editable):
         s1, s2 = st.columns(2)
         if s1.form_submit_button("Save", type="primary", use_container_width=True,
                                  disabled=task_id is None):
-            update_entry(entry["id"], task_id, datetime.combine(new_day, new_start), new_dur, new_note)
-            st.rerun()
+            new_dt = datetime.combine(new_day, new_start)
+            # Compared at minute precision: the widget drops seconds, so a
+            # stored 09:00:30 would otherwise read as a move every time.
+            was = dt.to_pydatetime() if hasattr(dt, "to_pydatetime") else dt
+            moved = (new_dt.replace(second=0, microsecond=0)
+                     != was.replace(second=0, microsecond=0)
+                     or int(new_dur) != int(entry["duration"]))
+            error = update_entry(entry["id"], user_id, task_id, new_dt, new_dur,
+                                 new_note, check_overlap=moved)
+            if error:
+                st.error(error)
+            else:
+                st.rerun()
         if s2.form_submit_button("Delete", use_container_width=True):
             delete_entry(entry["id"])
             st.rerun()
@@ -1639,7 +1773,8 @@ if pending:
         match = entries[entries["id"].astype(str) == str(pending[1])]
         if not match.empty:
             e = match.iloc[0].to_dict()
-            entry_dialog(e, lookup, editable=can_edit and not is_true(e.get("approved")))
+            entry_dialog(e, lookup, editable=can_edit and not is_true(e.get("approved")),
+                         user_id=viewing_id)
     elif kind == "add" and can_edit:
         # len check: a pending queued before slots existed carries no minute
         minute = pending[3] if len(pending) > 3 else 0
@@ -1869,7 +2004,8 @@ if untimed:
         lock = " (locked)" if is_true(e.get("approved")) else ""
         lbl = f"{e['dt'].strftime('%a %d')} - {fmt_dur(e['duration'])} - {info['client']}{lock}"
         if u_cols[j % len(u_cols)].button(lbl, key=f"u_{e['id']}", use_container_width=True):
-            entry_dialog(e, lookup, editable=can_edit and not is_true(e.get("approved")))
+            entry_dialog(e, lookup, editable=can_edit and not is_true(e.get("approved")),
+                         user_id=viewing_id)
 
 if is_confirmed:
     st.caption("Week is validated: all entries are validated and read-only.")

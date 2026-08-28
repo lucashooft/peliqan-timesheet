@@ -600,14 +600,85 @@ LOCKED_WEEK_STATUSES = {"submitted": "submitted for validation",
                         "confirmed": "validated"}
 
 
+def _parse_entry_datetime(value):
+    """
+    A timetable 'date' as a datetime, or None when it cannot be read.
+
+    [:19] keeps 'YYYY-MM-DDTHH:MM:SS' and drops any fractional seconds or
+    'Z' suffix - Python 3.10's fromisoformat (the runtime) rejects those.
+    Callers must treat None as "unreadable", never as a real instant.
+    """
+    try:
+        return datetime.fromisoformat(str(value).strip()[:19])
+    except (ValueError, TypeError, AttributeError):
+        return None
+
+
+def _entry_bounds(date_value, duration):
+    """
+    (start, end) for an entry, or None when it cannot occupy a slot at all.
+
+    An entry with no readable start time cannot overlap anything, so it is
+    skipped rather than treated as midnight - otherwise every one of them
+    would pile up at 00:00 and block the next one logged there.
+    """
+    start = _parse_entry_datetime(date_value)
+    if start is None:
+        return None
+    try:
+        minutes = int(float(duration))
+    except (TypeError, ValueError):
+        return None
+    if minutes <= 0:
+        return None
+    return start, start + timedelta(minutes=minutes)
+
+
+def _overlap_error(user_id, date_value, duration, exclude_id=None):
+    """
+    The entry this one would double-book, or None when the slot is free.
+
+    Half-open on purpose: an entry ending at 10:30 and one starting at 10:30
+    touch but do not overlap, and that is what an ordinary back-to-back day
+    looks like. Comparing inclusively here would reject most real days.
+
+    Reads ts_prod.timetable and never ts_reporting.fact_timetable: the
+    reporting table lags writes, and a stale read would wave through exactly
+    the overlap this exists to stop. create_row drops that cache after every
+    insert, which is also what lets a multi-entry batch see its own earlier
+    rows rather than only what was already committed when it started.
+
+    Pass exclude_id when updating, or the entry being edited is found as its
+    own clash and can never be saved.
+    """
+    new = _entry_bounds(date_value, duration)
+    if new is None:
+        return None
+    new_start, new_end = new
+
+    for row in fetch_cached("ts_prod", "timetable"):
+        if str(row.get("user_id")) != str(user_id):
+            continue
+        if exclude_id is not None and row.get("id") == exclude_id:
+            continue
+        other = _entry_bounds(row.get("date"), row.get("duration"))
+        if other is None:
+            continue
+        other_start, other_end = other
+        if new_start < other_end and other_start < new_end:
+            return (f"That overlaps entry {row.get('id')}, which runs "
+                    f"{other_start.strftime('%d-%m-%Y %H:%M')} to "
+                    f"{other_end.strftime('%H:%M')}. Entries may sit back to "
+                    f"back, but not on top of each other.")
+    return None
+
+
 def _week_start_of(value):
     """Monday of the week a timetable 'date' falls in, or None if unreadable."""
-    # [:19] keeps 'YYYY-MM-DDTHH:MM:SS' and drops any fractional seconds or
-    # 'Z' suffix - Python 3.10's fromisoformat (the runtime) rejects those,
-    # and an unread date here would fail OPEN, letting a locked week through.
-    try:
-        parsed = datetime.fromisoformat(str(value).strip()[:19])
-    except (ValueError, TypeError, AttributeError):
+    # An unread date here must fail OPEN - reporting it is the field-level
+    # checks' job - so a locked week is never let through on a parse error.
+    parsed = _parse_entry_datetime(value)
+    if parsed is None:
         return None
     return parsed.date() - timedelta(days=parsed.weekday())
 
@@ -635,12 +706,27 @@ def _check_entry_week_open(converted):
     """
     create_row("timetable", ...) - refuse to log into a locked week.
 
-    Rides on the cross_field_check hook rather than access_check, which
-    timetable already uses for its client restriction. Both run before
-    anything is written, which is all this needs.
+    Reached through _check_entry_cross_fields rather than registered
+    directly, since create_row offers only one cross_field_check slot.
     """
     return _week_lock_error(CURRENT_USER.get("user_id"), converted.get("date"),
                             "no new entries can be added to it")
+
+
+def _check_entry_overlap(converted):
+    """create_row("timetable", ...) - refuse to double-book a slot."""
+    return _overlap_error(CURRENT_USER.get("user_id"),
+                          converted.get("date"), converted.get("duration"))
+
+
+def _check_entry_cross_fields(converted):
+    """
+    Both cross-field rules for a new entry: the week has to be open, and the
+    slot has to be free. create_row exposes a single cross_field_check hook,
+    so they are chained here instead of one of them claiming it. Week first -
+    "that week is locked" is the more useful answer when both are true.
+    """
+    return _check_entry_week_open(converted) or _check_entry_overlap(converted)
 
 
 RESOURCE_CONFIG = {
@@ -684,7 +770,7 @@ RESOURCE_CONFIG = {
         "foreign_keys": {"task_id": "tasks"},
         "datetime_fields": {"date"},
         "server_managed": _timetable_server_managed,
-        "cross_field_check": _check_entry_week_open,
+        "cross_field_check": _check_entry_cross_fields,
         "access_check": _check_entry_client_access,
     },
 }
@@ -1143,6 +1229,8 @@ def log_time_entry(
 
     Nothing can be logged into a week the user has already submitted or
     that has been validated - that week is locked until it is unsubmitted.
+    Entries may not overlap each other either; back to back is fine, so an
+    entry ending at 10:30 and one starting at 10:30 are both accepted.
     :param task_id: id of the task the time is logged against
     :param date: date and time in format DD-MM-YYYY HH:MM
     :param duration: duration in minutes, minimum 30
@@ -1164,8 +1252,10 @@ def log_time_entries(entries_json: str) -> dict:
     Log multiple time entries at once for the logged-in user, in a single
     API call instead of one log_time_entry call per line. Use this tool
     only for 2 or more entries at once. Entries falling in a submitted or
-    validated week are refused individually, like any other invalid entry -
-    the rest of the batch still goes through.
+    validated week, or overlapping an entry that already exists, are refused
+    individually, like any other invalid entry - the rest of the batch still
+    goes through. Entries within one batch are checked against each other
+    too, so two overlapping lines in the same call cannot both land.
     :param entries_json: JSON array of objects, each with task_id, date
         (DD-MM-YYYY HH:MM), duration (minutes, minimum 30), internal_description,
         external_description
@@ -1264,6 +1354,20 @@ def update_time_entry(
                                      "an entry cannot be moved into it")
         if lock_error:
             return {"success": False, "error": lock_error}
+
+    # Only a MOVE can create an overlap. Entries written before this rule
+    # existed may already sit on top of each other, and refusing to let
+    # someone retitle one would punish them for a clash they did not make -
+    # so a description-only edit skips the check entirely.
+    if "date" in converted or "duration" in converted:
+        overlap_error = _overlap_error(
+            entry.get("user_id"),
+            converted.get("date", entry.get("date")),
+            converted.get("duration", entry.get("duration")),
+            exclude_id=entry_id,
+        )
+        if overlap_error:
+            return {"success": False, "error": overlap_error}
 
     check_task_id = converted.get("task_id", entry.get("task_id"))
     access_error = _check_entry_client_access({"task_id": check_task_id})
