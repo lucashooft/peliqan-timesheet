@@ -464,6 +464,7 @@ def mcp_response_authorization_server_openid_config():
 
 CACHE_TTL = 30
 MAX_DESCRIPTION_LEN = 1000
+MIN_DURATION_MINUTES = 30
 
 FULL_NAME_REGEX = re.compile(r"^[A-Za-zÀ-ÿ][A-Za-zÀ-ÿ0-9 &'\-]{1,99}$")
 POSITIVE_INT_REGEX = re.compile(r"^[1-9][0-9]*$")
@@ -822,8 +823,8 @@ def validate_and_convert_field(config: dict, field: str, value):
         return parsed.isoformat(), None
 
     if field == "duration":
-        if not (isinstance(value, (int, float)) and value > 0):
-            return None, "'duration' must be a number greater than 0."
+        if not (isinstance(value, (int, float)) and value >= MIN_DURATION_MINUTES):
+            return None, f"'duration' must be a number of at least {MIN_DURATION_MINUTES} minutes."
         return value, None
 
     if field == "billable":
@@ -1144,7 +1145,7 @@ def log_time_entry(
     that has been validated - that week is locked until it is unsubmitted.
     :param task_id: id of the task the time is logged against
     :param date: date and time in format DD-MM-YYYY HH:MM
-    :param duration: duration in minutes
+    :param duration: duration in minutes, minimum 30
     :param internal_description: internal description of the work
     :param external_description: client-facing description of the work
     """
@@ -1166,7 +1167,7 @@ def log_time_entries(entries_json: str) -> dict:
     validated week are refused individually, like any other invalid entry -
     the rest of the batch still goes through.
     :param entries_json: JSON array of objects, each with task_id, date
-        (DD-MM-YYYY HH:MM), duration, internal_description,
+        (DD-MM-YYYY HH:MM), duration (minutes, minimum 30), internal_description,
         external_description
     """
     try:
@@ -1214,7 +1215,7 @@ def update_time_entry(
     :param entry_id: id of the timetable row to update
     :param task_id: new task_id, 0 = leave unchanged
     :param date: new date and time in format DD-MM-YYYY HH:MM, empty = leave unchanged
-    :param duration: new duration in minutes, 0 = leave unchanged
+    :param duration: new duration in minutes, minimum 30, 0 = leave unchanged
     :param internal_description: new internal description, empty = leave unchanged
     :param external_description: new external description, empty = leave unchanged
     """

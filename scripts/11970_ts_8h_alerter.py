@@ -239,17 +239,12 @@ else:
                         "*Reminder: please submit your timesheets of this week*\n"
                     )
                 lines.append(
-                    f"Missing hours check \u2014 tracking since {window_start_str}\n\n"
+                    f"Missing hours check\n\n"
                     f"You have {len(by_user[user])} day(s) logged under "
                     f"{DAILY_THRESHOLD_MINUTES // 60}h that still need attention:"
                 )
                 for day, minutes in sorted(by_user[user]):
                     lines.append(format_shortfall_line(day, minutes))
-                lines.append("")
-                lines.append(
-                    "If any of these are already covered by leave or time off, "
-                    "check with your team lead so they can be marked validated."
-                )
                 lines.append("\nAdd/Edit your entries: <https://app.eu.peliqan.io/apps/dkV4ZE1JMW5obnhsblFJemM5anhKZEQ5UTZYWVp6TTNLZmhPRDJEcXZxeDljcnBndTBWcndnaWpIVmRoYjJwaw==/|Timesheet Calendar>")
                 text = "\n".join(lines)
 
