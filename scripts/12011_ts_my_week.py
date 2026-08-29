@@ -1586,6 +1586,13 @@ def login_page(message=None):
 # Peliqan's own parameters (embed=true, session_token).
 GOOGLE_PARAMS = ("code", "state", "scope", "authuser", "prompt", "hd", "error", "error_subtype")
 
+# This app's own params, round-tripped through the URL so a hard refresh
+# (which wipes st.session_state same as a fresh visit) lands back on the
+# week/user being viewed instead of today's week and the viewer's own
+# calendar. Set on every run below, read once at state init.
+WEEK_PARAM = "week"
+VIEW_PARAM = "as"
+
 
 def clear_login_params():
     for key in GOOGLE_PARAMS:
@@ -1674,7 +1681,14 @@ LOGIN_USER_ID = to_int(login_user.get("id"))
 # =====================================================
 
 if "week_start" not in st.session_state:
-    st.session_state.week_start = monday_of(date.today())
+    default_week = None
+    week_param = st.query_params.get(WEEK_PARAM)
+    if week_param:
+        try:
+            default_week = monday_of(date.fromisoformat(str(week_param)))
+        except ValueError:
+            default_week = None
+    st.session_state.week_start = default_week or monday_of(date.today())
 if "cal_nonce" not in st.session_state:
     st.session_state.cal_nonce = 0
 if "pending" not in st.session_state:
@@ -1711,10 +1725,21 @@ viewer_scope = to_int(viewer.get("scope")) or 1
 can_manage = viewer_scope >= MANAGE_SCOPE
 
 if can_manage:
+    viewing_widget_key = f"viewing_{viewer_id}"
+    if viewing_widget_key not in st.session_state:
+        # Pre-seed from the URL before the widget exists, same trick the
+        # dialogs use - a value already in session_state overrides `index`.
+        view_param = st.query_params.get(VIEW_PARAM)
+        try:
+            param_id = int(view_param) if view_param is not None else None
+        except ValueError:
+            param_id = None
+        if param_id in user_ids:
+            st.session_state[viewing_widget_key] = param_id
     viewing_id = view_col.selectbox(
         "Viewing calendar of", user_ids,
         index=user_ids.index(viewer_id),
-        key=f"viewing_{viewer_id}",     # keyed per viewer: switching viewer resets to self
+        key=viewing_widget_key,     # keyed per viewer: switching viewer resets to self
         format_func=lambda i: user_display_name(user_by_id[i]),
     )
 else:
@@ -1760,6 +1785,13 @@ if isinstance(picked_day, (list, tuple)):
     picked_day = picked_day[0] if picked_day else st.session_state.week_start
 if picked_day and monday_of(picked_day) != st.session_state.week_start:
     go_to_week(monday_of(picked_day))
+
+# Round-trip the week/viewing selection through the URL so a hard refresh
+# (see WEEK_PARAM/VIEW_PARAM above) lands back here instead of on today's
+# week and the viewer's own calendar.
+st.query_params[WEEK_PARAM] = st.session_state.week_start.isoformat()
+if can_manage:
+    st.query_params[VIEW_PARAM] = str(viewing_id)
 
 # =====================================================
 # Data for the viewed user + permissions for this week
