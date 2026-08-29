@@ -1344,6 +1344,11 @@ SESSION_HOURS = 12            # how long one login stays valid
 STATE_MAX_AGE = 30 * 60       # a started login must be completed within this
 COOKIE_PREFIX = "ts_my_week_"
 COOKIE_SESSION = "session"
+# Keyed per login user, same as the "viewing_{viewer_id}" widget key below,
+# so switching Google accounts on a shared browser doesn't leak one user's
+# week/viewing choice as another's default.
+COOKIE_WEEK_PREFIX = "week_"
+COOKIE_VIEWING_PREFIX = "viewing_"
 
 
 class LoginError(Exception):
@@ -1586,13 +1591,6 @@ def login_page(message=None):
 # Peliqan's own parameters (embed=true, session_token).
 GOOGLE_PARAMS = ("code", "state", "scope", "authuser", "prompt", "hd", "error", "error_subtype")
 
-# This app's own params, round-tripped through the URL so a hard refresh
-# (which wipes st.session_state same as a fresh visit) lands back on the
-# week/user being viewed instead of today's week and the viewer's own
-# calendar. Set on every run below, read once at state init.
-WEEK_PARAM = "week"
-VIEW_PARAM = "as"
-
 
 def clear_login_params():
     for key in GOOGLE_PARAMS:
@@ -1682,12 +1680,13 @@ LOGIN_USER_ID = to_int(login_user.get("id"))
 
 if "week_start" not in st.session_state:
     default_week = None
-    week_param = st.query_params.get(WEEK_PARAM)
-    if week_param:
-        try:
-            default_week = monday_of(date.fromisoformat(str(week_param)))
-        except ValueError:
-            default_week = None
+    if cookies is not None:
+        raw_week = cookies.get(f"{COOKIE_WEEK_PREFIX}{LOGIN_USER_ID}")
+        if raw_week:
+            try:
+                default_week = monday_of(date.fromisoformat(str(raw_week)))
+            except ValueError:
+                default_week = None
     st.session_state.week_start = default_week or monday_of(date.today())
 if "cal_nonce" not in st.session_state:
     st.session_state.cal_nonce = 0
@@ -1725,15 +1724,18 @@ viewer_scope = to_int(viewer.get("scope")) or 1
 can_manage = viewer_scope >= MANAGE_SCOPE
 
 if can_manage:
-    viewing_widget_key = f"viewing_{viewer_id}"
+    viewing_widget_key = f"{COOKIE_VIEWING_PREFIX}{viewer_id}"
     if viewing_widget_key not in st.session_state:
-        # Pre-seed from the URL before the widget exists, same trick the
+        # Pre-seed from the cookie before the widget exists, same trick the
         # dialogs use - a value already in session_state overrides `index`.
-        view_param = st.query_params.get(VIEW_PARAM)
-        try:
-            param_id = int(view_param) if view_param is not None else None
-        except ValueError:
-            param_id = None
+        param_id = None
+        if cookies is not None:
+            raw_view = cookies.get(viewing_widget_key)
+            if raw_view:
+                try:
+                    param_id = int(raw_view)
+                except ValueError:
+                    param_id = None
         if param_id in user_ids:
             st.session_state[viewing_widget_key] = param_id
     viewing_id = view_col.selectbox(
@@ -1786,12 +1788,29 @@ if isinstance(picked_day, (list, tuple)):
 if picked_day and monday_of(picked_day) != st.session_state.week_start:
     go_to_week(monday_of(picked_day))
 
-# Round-trip the week/viewing selection through the URL so a hard refresh
-# (see WEEK_PARAM/VIEW_PARAM above) lands back here instead of on today's
-# week and the viewer's own calendar.
-st.query_params[WEEK_PARAM] = st.session_state.week_start.isoformat()
-if can_manage:
-    st.query_params[VIEW_PARAM] = str(viewing_id)
+# Round-trip the week/viewing selection through the cookie jar (not the
+# URL: this app is normally rendered inside a Peliqan-owned iframe, and a
+# hard refresh reloads that iframe from its outer `src` - any query params
+# written here via JS never reach it) so a refresh lands back on the same
+# week and the same employee's calendar instead of resetting to today and
+# the viewer's own. Only write when changed, to avoid round-tripping the
+# cookie component every rerun (see the comment on state, above).
+if cookies is not None:
+    try:
+        week_key = f"{COOKIE_WEEK_PREFIX}{LOGIN_USER_ID}"
+        week_str = st.session_state.week_start.isoformat()
+        changed = cookies.get(week_key) != week_str
+        if changed:
+            cookies[week_key] = week_str
+        if can_manage:
+            view_str = str(viewing_id)
+            if cookies.get(viewing_widget_key) != view_str:
+                cookies[viewing_widget_key] = view_str
+                changed = True
+        if changed:
+            cookies.save()
+    except Exception:
+        pass
 
 # =====================================================
 # Data for the viewed user + permissions for this week
