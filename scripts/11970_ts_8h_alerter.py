@@ -37,12 +37,16 @@ Monitored users / team leads are both derived dynamically from ts_prod.users:
 anyone with a non-null name, email AND scope (this excludes placeholder
 "role" rows like "Admin (Scope 3)" which have no email).
 
-IMPORTANT CAVEAT: Slack DMs are sent as {"channel": "@<name>"}, using the
-exact ts_prod.users.name value as the Slack username. If someone's real
-Slack username differs from their displayed name, add an entry to
-SLACK_USERNAME_OVERRIDES below - otherwise their DM will fail the same way
-a bad channel name does (silently, from this script's point of view; check
-the printed Slack send results after each run).
+Slack DMs are sent as {"channel": "@<handle>"}, where the handle is the
+local part of the person's ts_prod.users.email - lucas@peliqan.io becomes
+@lucas. That holds for everyone, so there is no override table. A DM to a
+handle Slack does not know fails the way a bad channel name does, which is
+silently from this script's point of view; the run prints every resolved
+handle at the start and each send result after, so check those.
+
+NOTE: ts_prod.users.name is the join key against fact_timetable.user_name and
+the key of every per-user dict here, so two people sharing a name would be
+merged into one. Nothing enforces that; the email is the unique column.
 
 Deploy note: this script checks "is today Monday" itself for the team-lead
 digest, but the actual run frequency (daily vs weekly) is controlled by the
@@ -62,19 +66,17 @@ from datetime import date, timedelta
 TEAM_LEAD_SCOPE = 2
 
 # Restrict monitoring + all Slack DMs to only these people (matched against
-# ts_prod.users.name). Set to None to include everyone with name+email+scope
-# set (the previous, unrestricted behavior).
-NOTIFY_ONLY = ["Lucas", "Arthur"]
-#["Lucas", "Sander", "Piet-Michiel", "Arthur Haus"]
+# ts_prod.users.name). None means the whole roster, which is the point of
+# the roster query below - set a list here only to pilot a change on a few
+# people first.
+NOTIFY_ONLY = None
 
 
-# Maps ts_prod.users.name -> real Slack username, for anyone whose Slack
-# handle differs from their displayed name. Add entries as needed, e.g.
-# SLACK_USERNAME_OVERRIDES = {"Piet-Michiel": "pm_vdb"}
-SLACK_USERNAME_OVERRIDES = {}
+# name -> email, filled from the roster query. Read by slack_handle_for.
+EMAIL_BY_NAME = {}
 
 # Only shortfall days on/after this date are tracked/notified.
-FIXED_START_DATE = date(2026, 8, 28)
+FIXED_START_DATE = date(2026, 9, 1)
 SLACK_CONNECTION_NAME = "Slack"
 WORKDAY_MINUTES = 480
 DAILY_THRESHOLD_MINUTES = WORKDAY_MINUTES
@@ -96,7 +98,18 @@ def fetch_with_retry(dbconn, query, label):
 
 
 def slack_handle_for(name):
-    return SLACK_USERNAME_OVERRIDES.get(name, name)
+    """
+    The Slack username to DM this person.
+
+    The local part of their email - lucas@peliqan.io gives "lucas" - which
+    is how every handle here is set. Unlike the display name it survives
+    capitals, spaces and hyphens; "Piet-Michiel" was never going to resolve.
+
+    The roster query requires a non-null email, so anyone reaching this has
+    one. A blank result would send to "@", which the startup line prints as
+    an empty handle rather than hiding it.
+    """
+    return str(EMAIL_BY_NAME.get(name) or "").split("@")[0].strip()
 
 
 def format_shortfall_line(day, minutes):
@@ -148,13 +161,15 @@ else:
     # -------------------------------------------------------------------
 
     roster_query = """
-    SELECT name, scope
+    SELECT name, email, scope
     FROM ts_prod.users
     WHERE name IS NOT NULL
       AND email IS NOT NULL
       AND scope IS NOT NULL
     """
     roster_rows = fetch_with_retry(dbconn, roster_query, "Roster query")
+
+    EMAIL_BY_NAME.update({row["name"]: row["email"] for row in roster_rows})
 
     USER_LIST = [row["name"] for row in roster_rows]
     TEAM_LEADS = [row["name"] for row in roster_rows if row["scope"] >= TEAM_LEAD_SCOPE]
@@ -164,6 +179,8 @@ else:
         TEAM_LEADS = [u for u in TEAM_LEADS if u in NOTIFY_ONLY]
 
     print(f"Monitoring {len(USER_LIST)} user(s): {USER_LIST}")
+    print("Slack handles: "
+          + ", ".join(f"{u} -> @{slack_handle_for(u)}" for u in USER_LIST))
     print(f"Team leads (scope={TEAM_LEAD_SCOPE}): {TEAM_LEADS}")
 
     if not USER_LIST:
