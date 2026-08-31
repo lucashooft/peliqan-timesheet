@@ -185,9 +185,16 @@ with tab_approval:
     if not month_values:
         st.info("No entries found.")
     else:
-        selected_month = st.selectbox(
-            "Month", month_values, format_func=month_label, key="approval_month"
-        )
+        f1, f2 = st.columns(2)
+        with f1:
+            selected_month = st.selectbox(
+                "Month", month_values, format_func=month_label, key="approval_month"
+            )
+        with f2:
+            sort_by = st.radio(
+                "Sort by", ["Needs attention first", "Client name"],
+                horizontal=True, key="approval_sort",
+            )
         month_df = df[(df["month"] == selected_month) & (df["billable"])]
 
         if month_df.empty:
@@ -205,9 +212,12 @@ with tab_approval:
             )
             client_stats["approved"] = client_stats["approved"].astype(int)
             client_stats["fully_approved"] = client_stats["approved"] == client_stats["total"]
-            client_stats = client_stats.sort_values(
-                ["fully_approved", "client_name"], ascending=[True, True]
-            )
+            if sort_by == "Client name":
+                client_stats = client_stats.sort_values("client_name")
+            else:
+                client_stats = client_stats.sort_values(
+                    ["fully_approved", "client_name"], ascending=[True, True]
+                )
 
             total_entries = int(client_stats["total"].sum())
             total_approved = int(client_stats["approved"].sum())
