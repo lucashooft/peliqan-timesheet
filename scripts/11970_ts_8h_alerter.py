@@ -35,7 +35,8 @@ Two notifications per run:
 
 Monitored users / team leads are both derived dynamically from ts_prod.users:
 anyone with a non-null name, email AND scope (this excludes placeholder
-"role" rows like "Admin (Scope 3)" which have no email).
+"role" rows like "Admin (Scope 3)" which have no email). NOTIFY_ONLY narrows
+that to a named few; EXCLUDE drops individuals and is applied last.
 
 Slack DMs are sent as {"channel": "@<handle>"}, where the handle is the
 local part of the person's ts_prod.users.email - lucas@peliqan.io becomes
@@ -62,7 +63,7 @@ from datetime import date, timedelta
 # ---------------------------------------------------------------------------
 
 # ts_prod.users.scope value that identifies a "team lead" for the Monday
-# digest. Currently only "Lucas" has scope 2 in this account.
+# digest.
 TEAM_LEAD_SCOPE = 2
 
 # Restrict monitoring + all Slack DMs to only these people (matched against
@@ -70,6 +71,12 @@ TEAM_LEAD_SCOPE = 2
 # the roster query below - set a list here only to pilot a change on a few
 # people first.
 NOTIFY_ONLY = None
+
+# Never monitored and never DM'd, whatever the roster or NOTIFY_ONLY say -
+# applied last, so it always wins. A name or an email address both work,
+# matched case-insensitively: "Niko" and "niko@peliqan.io" exclude the same
+# person. Use the email where two people could share a first name.
+EXCLUDE = ["arthur@peliqan.io"]
 
 
 # name -> email, filled from the roster query. Read by slack_handle_for.
@@ -177,6 +184,27 @@ else:
     if NOTIFY_ONLY is not None:
         USER_LIST = [u for u in USER_LIST if u in NOTIFY_ONLY]
         TEAM_LEADS = [u for u in TEAM_LEADS if u in NOTIFY_ONLY]
+
+    if EXCLUDE:
+        excluded = {str(x).strip().lower() for x in EXCLUDE if str(x).strip()}
+
+        def is_excluded(user_name):
+            """Match on either the name or the email, so a list of addresses
+            and a list of names both behave the way someone would expect."""
+            return (user_name.strip().lower() in excluded
+                    or str(EMAIL_BY_NAME.get(user_name) or "").strip().lower()
+                    in excluded)
+
+        skipped = [u for u in USER_LIST if is_excluded(u)]
+        USER_LIST = [u for u in USER_LIST if not is_excluded(u)]
+        TEAM_LEADS = [u for u in TEAM_LEADS if not is_excluded(u)]
+        print(f"Excluded {len(skipped)} user(s): {skipped}")
+        # An entry matching nobody is nearly always a typo or a departed
+        # colleague, and silently doing nothing is how it stays wrong.
+        unmatched = excluded - {u.strip().lower() for u in skipped} - {
+            str(EMAIL_BY_NAME.get(u) or "").strip().lower() for u in skipped}
+        if unmatched:
+            print(f"WARNING: EXCLUDE entries matching no user: {sorted(unmatched)}")
 
     print(f"Monitoring {len(USER_LIST)} user(s): {USER_LIST}")
     print("Slack handles: "
