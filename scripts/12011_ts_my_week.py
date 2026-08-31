@@ -1149,6 +1149,11 @@ SESSION_HOURS = 12            # how long one login stays valid
 STATE_MAX_AGE = 30 * 60       # a started login must be completed within this
 COOKIE_PREFIX = "ts_my_week_"
 COOKIE_SESSION = "session"
+# Keyed per login user, same as the "viewing_{viewer_id}" widget key below,
+# so switching Google accounts on a shared browser doesn't leak one user's
+# week/viewing choice as another's default.
+COOKIE_WEEK_PREFIX = "week_"
+COOKIE_VIEWING_PREFIX = "viewing_"
 
 
 class LoginError(Exception):
@@ -1479,7 +1484,15 @@ LOGIN_USER_ID = to_int(login_user.get("id"))
 # =====================================================
 
 if "week_start" not in st.session_state:
-    st.session_state.week_start = monday_of(date.today())
+    default_week = None
+    if cookies is not None:
+        raw_week = cookies.get(f"{COOKIE_WEEK_PREFIX}{LOGIN_USER_ID}")
+        if raw_week:
+            try:
+                default_week = monday_of(date.fromisoformat(str(raw_week)))
+            except ValueError:
+                default_week = None
+    st.session_state.week_start = default_week or monday_of(date.today())
 if "cal_nonce" not in st.session_state:
     st.session_state.cal_nonce = 0
 if "pending" not in st.session_state:
@@ -1516,10 +1529,30 @@ viewer_scope = to_int(viewer.get("scope")) or 1
 can_manage = viewer_scope >= MANAGE_SCOPE
 
 if can_manage:
+    viewing_widget_key = f"{COOKIE_VIEWING_PREFIX}{viewer_id}"
+    # None once pre-seeded below: Streamlit warns if a default (`index`) and
+    # a session_state value are both supplied for the same widget in the
+    # same run (see seeded_key()'s docstring above) - None defers entirely
+    # to the pre-seeded session_state value instead of fighting it.
+    default_index = user_ids.index(viewer_id)
+    if viewing_widget_key not in st.session_state:
+        # Pre-seed from the cookie before the widget exists, same trick the
+        # dialogs use - a value already in session_state overrides `index`.
+        param_id = None
+        if cookies is not None:
+            raw_view = cookies.get(viewing_widget_key)
+            if raw_view:
+                try:
+                    param_id = int(raw_view)
+                except ValueError:
+                    param_id = None
+        if param_id in user_ids:
+            st.session_state[viewing_widget_key] = param_id
+            default_index = None
     viewing_id = view_col.selectbox(
         "Viewing calendar of", user_ids,
-        index=user_ids.index(viewer_id),
-        key=f"viewing_{viewer_id}",     # keyed per viewer: switching viewer resets to self
+        index=default_index,
+        key=viewing_widget_key,     # keyed per viewer: switching viewer resets to self
         format_func=lambda i: user_display_name(user_by_id[i]),
     )
 else:
@@ -1565,6 +1598,37 @@ if isinstance(picked_day, (list, tuple)):
     picked_day = picked_day[0] if picked_day else st.session_state.week_start
 if picked_day and monday_of(picked_day) != st.session_state.week_start:
     go_to_week(monday_of(picked_day))
+
+# Round-trip the week/viewing selection through the cookie jar (not the
+# URL: this app is normally rendered inside a Peliqan-owned iframe, and a
+# hard refresh reloads that iframe from its outer `src` - any query params
+# written here via JS never reach it) so a refresh lands back on the same
+# week and the same employee's calendar instead of resetting to today and
+# the viewer's own. Only write when changed, to avoid round-tripping the
+# cookie component every rerun (see the comment on state, above).
+#
+# cookies.save() renders its own component element right here in the page
+# - every other .save() call in this file is immediately followed by a
+# rerun for exactly that reason, so the element never survives to be seen.
+# st.rerun() raises a BaseException, not Exception, so it isn't swallowed
+# by the except below.
+if cookies is not None:
+    try:
+        week_key = f"{COOKIE_WEEK_PREFIX}{LOGIN_USER_ID}"
+        week_str = st.session_state.week_start.isoformat()
+        changed = cookies.get(week_key) != week_str
+        if changed:
+            cookies[week_key] = week_str
+        if can_manage:
+            view_str = str(viewing_id)
+            if cookies.get(viewing_widget_key) != view_str:
+                cookies[viewing_widget_key] = view_str
+                changed = True
+        if changed:
+            cookies.save()
+            st.rerun()
+    except Exception:
+        pass
 
 # =====================================================
 # Data for the viewed user + permissions for this week
