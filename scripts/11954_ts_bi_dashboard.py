@@ -106,6 +106,7 @@ if df.empty:
 df["entry_date"] = pd.to_datetime(df["entry_date"])
 df["hours"] = df["duration"].astype(float) / 60.0
 df["approved"] = df["approved"].apply(is_true)
+df["billable"] = df["billable"].apply(is_true)
 df["month"] = df["entry_date"].dt.to_period("M").dt.to_timestamp()
 df["project_name"] = df["project_name"].fillna("(no project)")
 df["client_name"] = df["client_name"].fillna("(no client)")
@@ -113,7 +114,7 @@ df["task_name"] = df["task_name"].fillna("(no task)")
 df["user_name"] = df["user_name"].fillna("(unknown employee)")
 
 st.title("Project BI Dashboard")
-st.caption("Approval status and project/task breakdowns, based on logged timesheet entries.")
+st.caption("Approval status (billable entries only) and project/task breakdowns, based on logged timesheet entries.")
 
 month_values = sorted(df["month"].dropna().unique(), reverse=True)
 
@@ -135,14 +136,19 @@ with tab_approval:
         selected_month = st.selectbox(
             "Month", month_values, format_func=month_label, key="approval_month"
         )
-        month_df = df[df["month"] == selected_month]
+        month_df = df[(df["month"] == selected_month) & (df["billable"])]
 
         if month_df.empty:
-            st.info(f"No entries for {month_label(selected_month)}.")
+            st.info(f"No billable entries for {month_label(selected_month)}.")
         else:
             client_stats = (
                 month_df.groupby("client_name")
-                .agg(total=("entry_id", "count"), approved=("approved", "sum"))
+                .agg(
+                    total=("entry_id", "count"),
+                    approved=("approved", "sum"),
+                    total_hours=("hours", "sum"),
+                    approved_hours=("hours", lambda s: s[month_df.loc[s.index, "approved"]].sum()),
+                )
                 .reset_index()
             )
             client_stats["approved"] = client_stats["approved"].astype(int)
@@ -153,9 +159,17 @@ with tab_approval:
 
             total_entries = int(client_stats["total"].sum())
             total_approved = int(client_stats["approved"].sum())
-            st.metric(
-                f"Approved entries for {month_label(selected_month)}",
+            total_hours = client_stats["total_hours"].sum()
+            approved_hours = client_stats["approved_hours"].sum()
+
+            m1, m2 = st.columns(2)
+            m1.metric(
+                f"Billable entries approved for {month_label(selected_month)}",
                 f"{total_approved} / {total_entries}",
+            )
+            m2.metric(
+                "Billable hours approved",
+                f"{approved_hours:.1f} / {total_hours:.1f}",
             )
 
             for _, row in client_stats.iterrows():
@@ -163,9 +177,12 @@ with tab_approval:
                 total = int(row["total"])
                 approved = int(row["approved"])
                 if row["fully_approved"]:
-                    label = f"✅ {client} — APPROVED ({total} entries)"
+                    label = f"✅ {client} — APPROVED ({total} entries, {row['total_hours']:.1f}h)"
                 else:
-                    label = f"{client} — {approved}/{total} approved"
+                    label = (
+                        f"{client} — {approved}/{total} approved "
+                        f"({row['approved_hours']:.1f}/{row['total_hours']:.1f}h)"
+                    )
 
                 with st.expander(label):
                     unapproved = month_df[
@@ -216,13 +233,16 @@ with tab_explorer:
     if scoped.empty:
         st.info("No entries match the selected filters.")
     else:
+        client_expanded = explorer_client != ALL_CLIENTS
         for client, client_df in scoped.groupby("client_name", sort=True):
-            st.subheader(client)
-            for project, project_df in client_df.groupby("project_name", sort=True):
-                proj_total = len(project_df)
-                proj_approved = int(project_df["approved"].sum())
-                label = f"{project} — {proj_approved}/{proj_total} approved"
-                with st.expander(label):
+            client_total = len(client_df)
+            client_approved = int(client_df["approved"].sum())
+            client_label = f"{client} — {client_approved}/{client_total} approved"
+            with st.expander(client_label, expanded=client_expanded):
+                for project, project_df in client_df.groupby("project_name", sort=True):
+                    proj_total = len(project_df)
+                    proj_approved = int(project_df["approved"].sum())
+                    st.markdown(f"**{project}** — {proj_approved}/{proj_total} approved")
                     entries = project_df.sort_values(["task_name", "entry_date"])
                     st.dataframe(
                         entries[
@@ -239,4 +259,4 @@ with tab_explorer:
                             "approved": "Approved",
                         },
                     )
-            st.divider()
+                    st.divider()
