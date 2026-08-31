@@ -145,10 +145,13 @@ PROJECT_CHOICES = None
 SLOT_MIN = 15                # add-target granularity, in minutes
 SLOTS_PER_H = 60 // SLOT_MIN
 
-# Only reached by start_time_input's fallback - see there. st.time_input's
-# `step` decides which times are VALID, not merely which ones the menu lists,
-# so this is the coarsest step that still lets 13:42 be entered at all.
-START_STEP = timedelta(minutes=1)
+# The quarter hours the start menu offers: 06:00 up to and including 19:45.
+# Nobody scrolls past midnight to find 09:00, and the hours outside this are
+# rare enough to be worth typing. They are NOT forbidden - anything typed is
+# still accepted, and an entry that already starts outside the range keeps
+# its own time in the list so the menu opens on it.
+MENU_FROM_H = 6
+MENU_TO_H = 20
 
 # Whether st.selectbox can take a value outside its options. Peliqan pins its
 # own Streamlit and this app cannot choose it, so ask rather than assume: on a
@@ -549,7 +552,106 @@ def duplicate_task(lookup, project_id, name):
                for info in lookup.values())
 
 
+def entry_bounds(row):
+    """
+    (start, end) for a row holding `dt` and `duration`, or None.
+
+    An entry with no start time cannot overlap anything - the grid lists
+    those under the calendar rather than in it - so it is skipped instead of
+    being treated as midnight, which would pile them all up at 00:00.
+    """
+    start = row.get("dt")
+    if start is None or pd.isna(start):
+        return None
+    minutes = to_int(row.get("duration")) or 0
+    if minutes <= 0:
+        return None
+    if hasattr(start, "to_pydatetime"):
+        start = start.to_pydatetime()
+    return start, start + timedelta(minutes=minutes)
+
+
+def conflicting_entry(rows, entry_dt, duration_minutes, exclude_id=None):
+    """
+    The row this entry would double-book, as (row, start, end), or None.
+
+    Half-open on purpose: an entry ending at 10:30 and one starting at 10:30
+    touch but do not overlap, which is what an ordinary back-to-back day
+    looks like. Comparing inclusively would reject most real days.
+
+    Pass exclude_id when editing, or the entry being changed is found as its
+    own clash and can never be saved.
+
+    `rows` must already be ONE user's entries: both callers hand it rows
+    filtered by user_id in SQL. The matching rule in ts_mcp_server
+    (_overlap_error) filters internally instead, so if you ever feed this
+    something wider, filter first - a colleague's entry is not a clash.
+    """
+    minutes = to_int(duration_minutes) or 0
+    if minutes <= 0:
+        return None
+    new_end = entry_dt + timedelta(minutes=minutes)
+    for row in rows:
+        if exclude_id is not None and to_int(row.get("id")) == to_int(exclude_id):
+            continue
+        bounds = entry_bounds(row)
+        if bounds is None:
+            continue
+        start, end = bounds
+        if entry_dt < end and start < new_end:
+            return row, start, end
+    return None
+
+
+def overlap_message(conflict, lookup):
+    """Name the entry in the way, not just the fact of it."""
+    row, start, end = conflict
+    info = lookup.get(to_int(row.get("task_id")), LOOKUP_DEFAULT)
+    return (f"That overlaps **{info['task']}** on {start.strftime('%a %d %b')}, "
+            f"{start.strftime('%H:%M')} to {end.strftime('%H:%M')}. Entries can "
+            f"sit back to back, but not on top of each other.")
+
+
+def neighbour_rows(user_id, day):
+    """
+    The user's entries around `day`, read straight from the table.
+
+    Not load_entries: that is cached for 60s and only cleared by this app's
+    own writes, so an entry logged through the MCP a minute ago would be
+    invisible and the overlap waved through. A save is rare enough to afford
+    its own read.
+
+    A day either side is included because an entry can run past midnight,
+    and the neighbour it would collide with then carries the next date.
+    """
+    dbconn = pq.dbconnect(DW_NAME)
+    lo = (day - timedelta(days=1)).isoformat()
+    hi = (day + timedelta(days=2)).isoformat()
+    rows = dbconn.fetch(DW_NAME, query=f"""
+        SELECT id, task_id, date, duration
+        FROM {S}.timetable
+        WHERE user_id::text = '{int(user_id)}'
+          AND date >= '{lo}' AND date < '{hi}'
+    """) or []
+    out = []
+    for r in rows:
+        dt = pd.to_datetime(r.get("date"), errors="coerce")
+        if pd.isna(dt):
+            continue
+        out.append({"id": to_int(r.get("id")), "task_id": to_int(r.get("task_id")),
+                    "dt": dt, "duration": to_int(r.get("duration")) or 0})
+    return out
+
+
 def insert_entry(user_id, task_id, entry_dt, duration_minutes, note):
+    """Write the entry, or return why it was refused. The write boundary
+    re-checks even when the dialog already did: this is the last point
+    before the row lands."""
+    conflict = conflicting_entry(neighbour_rows(user_id, entry_dt.date()),
+                                 entry_dt, duration_minutes)
+    if conflict:
+        return overlap_message(conflict, load_task_lookup())
+
     dbconn = pq.dbconnect(DW_NAME)
     dbconn.insert(DW_NAME, S, "timetable", {
         "user_id": int(user_id),
@@ -563,9 +665,26 @@ def insert_entry(user_id, task_id, entry_dt, duration_minutes, note):
         "approved_by": None,
     })
     load_entries.clear()
+    return None
 
 
-def update_entry(entry_id, task_id, entry_dt, duration_minutes, note):
+def update_entry(entry_id, user_id, task_id, entry_dt, duration_minutes, note,
+                 check_overlap=True):
+    """
+    Write the change, or return why it was refused.
+
+    check_overlap is False when only the task or the note changed: entries
+    written before this rule existed may already sit on top of each other,
+    and refusing to let someone retitle one would punish them for a clash
+    they did not make. Only a move is checked.
+    """
+    if check_overlap:
+        conflict = conflicting_entry(neighbour_rows(user_id, entry_dt.date()),
+                                     entry_dt, duration_minutes,
+                                     exclude_id=entry_id)
+        if conflict:
+            return overlap_message(conflict, load_task_lookup())
+
     dbconn = pq.dbconnect(DW_NAME)
     dbconn.update(DW_NAME, S, "timetable", int(entry_id), {
         "task_id": int(task_id),
@@ -574,6 +693,7 @@ def update_entry(entry_id, task_id, entry_dt, duration_minutes, note):
         "internal_description": (note or "").strip(),
     })
     load_entries.clear()
+    return None
 
 
 def delete_entry(entry_id):
@@ -678,33 +798,44 @@ def parse_typed_time(text):
 
 def start_time_input(container, value, key):
     """
-    Start time: a quarter-hour menu that also accepts any minute typed.
+    Start time: a quarter-hour menu that also accepts any minute.
 
-    st.time_input cannot do both. Its `step` sets which values are VALID,
-    not merely which ones the menu lists, so the step short enough to type
-    13:42 is also the one that makes the menu 1440 rows long. A selectbox
-    that accepts new options separates the two concerns: the menu stays at
-    SLOT_MIN, and anything typed is parsed instead of rejected.
+    Always a selectbox, never st.time_input. time_input's `step` decides
+    which values are VALID rather than merely which ones the menu lists, so
+    the step short enough to accept 13:42 also makes the menu 1440 rows
+    long - and a list that long opens at the top instead of on the entry's
+    own time, which was the entire complaint.
 
-    An off-grid value is spliced into the options at its sorted position, so
-    an entry starting at 13:42 opens the menu on 13:42 rather than on
-    nothing - which is what used to send it back to midnight.
+    The menu lists MENU_FROM_H to MENU_TO_H only. A value outside that - an
+    early start, or a minute off the quarter hour like 13:42 - is spliced
+    into the options at its sorted position, so the menu still opens on the
+    entry's own time rather than on nothing.
 
-    Where the runtime's Streamlit predates accept_new_options, falls back to
-    time_input at START_STEP: still typeable, just a longer menu.
+    Typing an exact time into the same box needs accept_new_options, which
+    older Streamlit lacks. There a second small field takes it instead, so
+    every runtime gets a short menu that lands on the value; only the way
+    you enter an unusual time differs.
     """
     value = (value or time(9, 0)).replace(second=0, microsecond=0)
-    if not CAN_TYPE_NEW_OPTIONS:
-        return container.time_input("Start", value=value, step=START_STEP, key=key)
-
     current = value.strftime("%H:%M")
-    choices = sorted({f"{h:02d}:{m:02d}" for h in range(24)
+    choices = sorted({f"{h:02d}:{m:02d}"
+                      for h in range(MENU_FROM_H, MENU_TO_H)
                       for m in range(0, 60, SLOT_MIN)} | {current})
+    hint = (f"Pick a quarter hour between {MENU_FROM_H:02d}:00 and "
+            f"{MENU_TO_H - 1:02d}:45, or type any time at all - 13:42, "
+            f"1342 and 13.42 all work, and so does 05:30.")
     picked = container.selectbox(
-        "Start", choices, index=choices.index(current), key=key,
-        accept_new_options=True,
-        help="Pick a quarter hour, or type any time - 13:42, 1342 and 13.42 all work",
+        "Start", choices, index=choices.index(current), key=key, help=hint,
+        **({"accept_new_options": True} if CAN_TYPE_NEW_OPTIONS else {}),
     )
+    if not CAN_TYPE_NEW_OPTIONS:
+        # This runtime's selectbox takes no free text, so an exact time needs
+        # somewhere else to go. Empty means "use the menu".
+        other = container.text_input(
+            "Start (exact)", value="", key=f"{key}_typed", placeholder="or type 13:42",
+            label_visibility="collapsed", help=hint)
+        if other.strip():
+            picked = other
     typed = parse_typed_time(picked)
     if typed is None:
         # Keep the old value rather than guessing: a start time silently
@@ -773,16 +904,16 @@ def new_task_fields(projects):
 
     c1, c2 = st.columns([2, 1])
     project_id = c1.selectbox(
-        "Project", ids, index=None, key="add_new_project",
+        "Project", ids, index=None, key=dialog_key("add_new_project"),
         placeholder="Choose a project...",
         format_func=lambda i: f"{projects[i]['client']} - {projects[i]['project']}")
     status = c2.selectbox("Status", TASK_STATUSES,
                           index=TASK_STATUSES.index(NEW_TASK_STATUS),
-                          key="add_new_status")
-    name = st.text_input("Task name", key="add_new_name",
+                          key=dialog_key("add_new_status"))
+    name = st.text_input("Task name", key=dialog_key("add_new_name"),
                          placeholder="What is this task called?")
-    billable = st.checkbox("Billable", value=NEW_TASK_BILLABLE, key="add_new_billable")
-    description = st.text_area("Description", key="add_new_desc", height=68,
+    billable = st.checkbox("Billable", value=NEW_TASK_BILLABLE, key=dialog_key("add_new_billable"))
+    description = st.text_area("Description", key=dialog_key("add_new_desc"), height=68,
                                placeholder="Optional")
     return {"project_id": project_id, "status": status, "name": name,
             "billable": billable, "description": description}
@@ -873,10 +1004,57 @@ def export_dialog(can_manage, user_ids, user_by_id, default_month):
     )
 
 
+def dialog_key(name):
+    """
+    A widget key belonging to the CURRENT opening of a dialog.
+
+    Clearing a key out of session_state does not reset a widget: the browser
+    still holds it and sends its value back with the next rerun, so
+    Streamlit restores that value before `value=` or `index=` is consulted.
+    A key that changes sidesteps it - the widget is a different one, with no
+    history to restore, so it takes the default it is given. Same trick as
+    the week picker and the calendar chart further down this file.
+    """
+    return f"{name}_{st.session_state.get('dialog_token', 0)}"
+
+
+def seeded_key(name, value):
+    """
+    A STABLE widget key, reset once per dialog opening.
+
+    Same result as dialog_key without rebuilding the widget: writing
+    session_state before a widget is instantiated sets the value it opens
+    with. Wanted for the date input specifically, because a remounted date
+    input can take focus and focus opens its calendar - which is why one
+    would pop open by itself, on the same entry, only sometimes.
+
+    Seeded once per opening rather than on every rerun, or the day could
+    never be changed: each keystroke elsewhere in the dialog would put it
+    back. Do not pass `value=` to a widget keyed this way; Streamlit warns
+    when a default and a session_state value are both supplied.
+    """
+    token = st.session_state.get("dialog_token", 0)
+    stamp = f"{name}__seeded_for"
+    if st.session_state.get(stamp) != token:
+        st.session_state[name] = value
+        st.session_state[stamp] = token
+    return name
+
+
+def open_dialog():
+    """
+    Retire the previous opening's widgets. Call immediately BEFORE opening
+    any dialog, never inside one - during a dialog's own fragment reruns the
+    token has to stay put, or every keystroke would rebuild the form and
+    throw away what is being typed.
+    """
+    st.session_state.dialog_token = st.session_state.get("dialog_token", 0) + 1
+
+
 @st.dialog("New entry")
 def add_dialog(user_id, day, lookup, default_start=time(9, 0)):
     st.caption(day.strftime("%A %d %B %Y"))
-    task_id = task_selectbox(lookup, "add_task")
+    task_id = task_selectbox(lookup, dialog_key("add_task"))
 
     # Picked a task: show what it is. Picked nothing: offer to create one.
     new_task = None
@@ -888,17 +1066,22 @@ def add_dialog(user_id, day, lookup, default_start=time(9, 0)):
 
     st.divider()
     c1, c2 = st.columns(2)
-    start = start_time_input(c1, default_start, "add_start_pick")
-    dur = c2.number_input("Duration (min)", min_value=5, step=15, value=60, key="add_dur")
-    note = st.text_area("Note", key="add_note", height=80)
+    start = start_time_input(c1, default_start, dialog_key("add_start_pick"))
+    dur = c2.number_input("Duration (min)", min_value=5, step=15, value=60, key=dialog_key("add_dur"))
+    note = st.text_area("Note", key=dialog_key("add_note"), height=80)
 
     ready = task_id is not None or bool(
         new_task and new_task["project_id"] is not None and new_task["name"].strip())
     label = "Save" if task_id is not None else "Create task and save"
     if st.button(label, type="primary", use_container_width=True, key="add_save",
                  disabled=not ready):
-        error = None
-        if task_id is None:
+        entry_dt = datetime.combine(day, start)
+        # The slot is checked FIRST, before any task is created: a refused
+        # save must not leave a new task behind for a row that never landed.
+        conflict = conflicting_entry(neighbour_rows(user_id, day), entry_dt, dur)
+        error = overlap_message(conflict, lookup) if conflict else None
+
+        if not error and task_id is None:
             if duplicate_task(lookup, new_task["project_id"], new_task["name"]):
                 error = ("That project already has a task with this name. "
                          "Pick it from the list above instead.")
@@ -906,15 +1089,16 @@ def add_dialog(user_id, day, lookup, default_start=time(9, 0)):
                 task_id, error = create_task(
                     new_task["name"], new_task["project_id"], new_task["status"],
                     new_task["billable"], new_task["description"])
+        if not error:
+            error = insert_entry(user_id, task_id, entry_dt, dur, note)
         if error:
             st.error(error)
         else:
-            insert_entry(user_id, task_id, datetime.combine(day, start), dur, note)
             st.rerun()
 
 
 @st.dialog("Entry")
-def entry_dialog(entry, lookup, editable):
+def entry_dialog(entry, lookup, editable, user_id):
     info = lookup.get(to_int(entry.get("task_id")), LOOKUP_DEFAULT)
     dt = entry["dt"]
     st.markdown(
@@ -932,19 +1116,30 @@ def entry_dialog(entry, lookup, editable):
         return
 
     with st.form("edit_form", border=False):
-        task_id = task_selectbox(lookup, "edit_task", current=to_int(entry.get("task_id")))
+        task_id = task_selectbox(lookup, dialog_key("edit_task"), current=to_int(entry.get("task_id")))
         c1, c2, c3 = st.columns(3)
-        new_day = c1.date_input("Day", value=dt.date(), key="edit_day")
-        new_start = start_time_input(c2, dt.time(), "edit_start_pick")
+        new_day = c1.date_input("Day", key=seeded_key("edit_day", dt.date()))
+        new_start = start_time_input(c2, dt.time(), dialog_key("edit_start_pick"))
         new_dur = c3.number_input("Duration (min)", min_value=5, step=15,
-                                  value=int(entry["duration"]), key="edit_dur")
+                                  value=int(entry["duration"]), key=dialog_key("edit_dur"))
         new_note = st.text_area("Note", value=entry.get("internal_description") or "",
-                                key="edit_note", height=80)
+                                key=dialog_key("edit_note"), height=80)
         s1, s2 = st.columns(2)
         if s1.form_submit_button("Save", type="primary", use_container_width=True,
                                  disabled=task_id is None):
-            update_entry(entry["id"], task_id, datetime.combine(new_day, new_start), new_dur, new_note)
-            st.rerun()
+            new_dt = datetime.combine(new_day, new_start)
+            # Compared at minute precision: the widget drops seconds, so a
+            # stored 09:00:30 would otherwise read as a move every time.
+            was = dt.to_pydatetime() if hasattr(dt, "to_pydatetime") else dt
+            moved = (new_dt.replace(second=0, microsecond=0)
+                     != was.replace(second=0, microsecond=0)
+                     or int(new_dur) != int(entry["duration"]))
+            error = update_entry(entry["id"], user_id, task_id, new_dt, new_dur,
+                                 new_note, check_overlap=moved)
+            if error:
+                st.error(error)
+            else:
+                st.rerun()
         if s2.form_submit_button("Delete", use_container_width=True):
             delete_entry(entry["id"])
             st.rerun()
@@ -1703,10 +1898,13 @@ if pending:
         match = entries[entries["id"].astype(str) == str(pending[1])]
         if not match.empty:
             e = match.iloc[0].to_dict()
-            entry_dialog(e, lookup, editable=can_edit and not is_true(e.get("approved")))
+            open_dialog()
+            entry_dialog(e, lookup, editable=can_edit and not is_true(e.get("approved")),
+                         user_id=viewing_id)
     elif kind == "add" and can_edit:
         # len check: a pending queued before slots existed carries no minute
         minute = pending[3] if len(pending) > 3 else 0
+        open_dialog()
         add_dialog(viewing_id, pending[1], lookup,
                    default_start=time(pending[2], minute))
 
@@ -1790,6 +1988,7 @@ for i, d in enumerate(days):
             if st.button("Add an entry", key=f"add_day_{d.isoformat()}",
                          help=f"Add an entry on {d.strftime('%a %d %b')}",
                          use_container_width=True):
+                open_dialog()
                 add_dialog(viewing_id, d, lookup)
         
 
@@ -1933,7 +2132,9 @@ if untimed:
         lock = " (locked)" if is_true(e.get("approved")) else ""
         lbl = f"{e['dt'].strftime('%a %d')} - {fmt_dur(e['duration'])} - {info['client']}{lock}"
         if u_cols[j % len(u_cols)].button(lbl, key=f"u_{e['id']}", use_container_width=True):
-            entry_dialog(e, lookup, editable=can_edit and not is_true(e.get("approved")))
+            open_dialog()
+            entry_dialog(e, lookup, editable=can_edit and not is_true(e.get("approved")),
+                         user_id=viewing_id)
 
 if is_confirmed:
     st.caption("Week is validated: all entries are validated and read-only.")
