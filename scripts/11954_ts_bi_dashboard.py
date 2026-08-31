@@ -185,16 +185,29 @@ with tab_approval:
     if not month_values:
         st.info("No entries found.")
     else:
+        # Survive a full page refresh (not just a rerun) by round-tripping
+        # the selected month through the URL's query string - session_state
+        # resets on refresh, but st.query_params doesn't. index= only seeds
+        # the widget on a truly fresh session; once "approval_month" exists
+        # in session_state, later reruns use that instead (same pattern
+        # ts_my_week already uses for its own query params).
+        month_strs = [pd.Timestamp(m).strftime("%Y-%m") for m in month_values]
+        qp_month = st.query_params.get("month")
+        default_month_index = month_strs.index(qp_month) if qp_month in month_strs else 0
+
         f1, f2 = st.columns(2)
         with f1:
             selected_month = st.selectbox(
-                "Month", month_values, format_func=month_label, key="approval_month"
+                "Month", month_values, format_func=month_label, key="approval_month",
+                index=default_month_index,
             )
         with f2:
             sort_by = st.radio(
                 "Sort by", ["Needs attention first", "Client name"],
                 horizontal=True, key="approval_sort",
             )
+        st.query_params["month"] = pd.Timestamp(selected_month).strftime("%Y-%m")
+
         month_df = df[(df["month"] == selected_month) & (df["billable"])]
 
         if month_df.empty:
@@ -246,7 +259,7 @@ with tab_approval:
                         f"({row['approved_hours']:.1f}/{row['total_hours']:.1f}h)"
                     )
 
-                with st.expander(label):
+                with st.expander(label, key=f"approval_expander_{selected_month}_{client}"):
                     unapproved = month_df[
                         (month_df["client_name"] == client) & (~month_df["approved"])
                     ].sort_values(["entry_date", "user_name"])
@@ -302,6 +315,19 @@ with tab_explorer:
                 key="explorer_client",
             )
 
+        # Client expanders below are keyed widgets, so once a user manually
+        # opens/closes one, Streamlit remembers that across reruns instead
+        # of us re-forcing a value every time (that was the bug: passing a
+        # freshly computed expanded= on every rerun - including ones caused
+        # just by editing a table cell - snapped expanders shut mid-edit).
+        # The only time we WANT to override the user's choice is when the
+        # client filter itself changes, to re-apply auto-expand-on-filter.
+        if st.session_state.get("_explorer_client_seen") != explorer_client:
+            for k in list(st.session_state.keys()):
+                if k.startswith("explorer_client_expander_"):
+                    del st.session_state[k]
+            st.session_state["_explorer_client_seen"] = explorer_client
+
         scoped = live_df
         if explorer_month != ALL_MONTHS:
             scoped = scoped[scoped["month"] == explorer_month]
@@ -316,7 +342,10 @@ with tab_explorer:
                 client_total = len(client_df)
                 client_approved = int(client_df["approved"].sum())
                 client_label = f"{client} — {client_approved}/{client_total} approved"
-                with st.expander(client_label, expanded=client_expanded):
+                with st.expander(
+                    client_label, expanded=client_expanded,
+                    key=f"explorer_client_expander_{client}",
+                ):
                     for project, project_df in client_df.groupby("project_name", sort=True):
                         proj_total = len(project_df)
                         proj_approved = int(project_df["approved"].sum())
