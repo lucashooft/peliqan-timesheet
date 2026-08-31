@@ -19,29 +19,30 @@ else:  # Running outside of Peliqan
         RUN_CONTEXT = "background"
 
 """
-project_bi_dashboard (v2.0)
+project_bi_dashboard (v3.0)
 
 BI dashboard for approval tracking and project analytics, built on top of
 timesheet data.
 
-Data source:
-  - ts_reporting.fact_timetable      : read-only, already joins timetable
-                                        entries with tasks, projects, clients
-                                        and users. "approved" here is the
-                                        entry-level validation flag (see
-                                        ts_prod.timetable.approved).
+Two tabs, two different data sources:
+  - Approval overview : reads ts_reporting.fact_timetable (read-only, joins
+                         timetable entries with tasks, projects, clients and
+                         users). Fine for reporting - it lags writes to
+                         ts_prod until its own query re-runs, but nothing on
+                         this tab writes anything.
+  - Project explorer   : reads AND writes ts_prod.timetable/tasks/projects/
+                         clients/users directly. It has to - fact_timetable
+                         is a materialized query table, so an edit made
+                         through it would not show up here until Peliqan
+                         re-runs that query, which would look like the edit
+                         silently reverted. Hours and the Approved flag are
+                         editable inline; everything else (task, employee,
+                         date, billable) is read-only.
 
-This app is read-only - it never writes to ts_prod.
-
-Two tabs:
-  - Approval overview : pick a month, see every client's approved/total
-                         entry count for that month (a client that hits
-                         100% shows APPROVED instead of a fraction), and
-                         expand a client to see exactly which entries are
-                         still unapproved.
-  - Project explorer  : pick a month and/or a client, browse every project
-                         underneath with its tasks and the individual
-                         entries logged against them.
+NOTE: this app has no login and no scope check (see CLAUDE.md - only
+ts_my_week and ts_mcp_server enforce anything). That means the Project
+explorer's editing is wide open to anyone with the dashboard URL. Accepted
+as a known tradeoff for now.
 """
 
 import streamlit as st
@@ -59,23 +60,44 @@ st.markdown(
     unsafe_allow_html=True,
 )
 
+DW_NAME = pq.DW_NAME
+S = "ts_prod"
+
 ALL_MONTHS = "(all months)"
 ALL_CLIENTS = "(all clients)"
 
 
 def is_true(v):
-    # fact_timetable is a query table; booleans can come back as True or as
-    # the strings "true"/"1" depending on how the value was written.
+    # Booleans coming back through Peliqan's query layer can be True, or the
+    # strings "true"/"1", depending on how the value was written.
     return v in (True, "true", "True", 1, "1")
 
 
+def prepare_df(raw_df):
+    """Shared post-processing for both data sources - they return the same
+    column shape (entry_id, entry_date, duration, billable, approved,
+    task_name, task_status, project_name, project_status, project_end_date,
+    client_name, user_id, user_name)."""
+    d = raw_df.copy()
+    d["entry_date"] = pd.to_datetime(d["entry_date"])
+    d["hours"] = d["duration"].astype(float) / 60.0
+    d["approved"] = d["approved"].apply(is_true)
+    d["billable"] = d["billable"].apply(is_true)
+    d["month"] = d["entry_date"].dt.to_period("M").dt.to_timestamp()
+    d["project_name"] = d["project_name"].fillna("(no project)")
+    d["client_name"] = d["client_name"].fillna("(no client)")
+    d["task_name"] = d["task_name"].fillna("(no task)")
+    d["user_name"] = d["user_name"].fillna("(unknown employee)")
+    return d
+
+
 # =====================================================
-# Data loading
+# Data loading - Approval overview (read-only)
 # =====================================================
 
 @st.cache_data(ttl=300)
 def load_entries():
-    dbconn = pq.dbconnect(pq.DW_NAME)
+    dbconn = pq.dbconnect(DW_NAME)
     sql = """
         SELECT
             e.entry_id,
@@ -93,25 +115,55 @@ def load_entries():
             e.user_name
         FROM ts_reporting.fact_timetable e
     """
-    df = dbconn.fetch(pq.DW_NAME, query=sql, df=True)
-    return df
+    return dbconn.fetch(DW_NAME, query=sql, df=True)
 
 
-df = load_entries()
+# =====================================================
+# Data loading / writing - Project explorer (live, editable)
+# =====================================================
 
-if df.empty:
+@st.cache_data(ttl=60)
+def load_live_entries():
+    dbconn = pq.dbconnect(DW_NAME)
+    sql = f"""
+        SELECT
+            t.id                       AS entry_id,
+            t.date                     AS entry_date,
+            COALESCE(t.duration, 0)    AS duration,
+            COALESCE(tk.billable, FALSE) AS billable,
+            COALESCE(t.approved, FALSE)  AS approved,
+            tk.name                    AS task_name,
+            tk.status                  AS task_status,
+            p.name                     AS project_name,
+            p.status                   AS project_status,
+            p.end_date                 AS project_end_date,
+            c.name                     AS client_name,
+            t.user_id                  AS user_id,
+            COALESCE(u.name, u.email)  AS user_name
+        FROM {S}.timetable t
+        LEFT JOIN {S}.tasks    tk ON tk.id = t.task_id
+        LEFT JOIN {S}.projects p  ON p.id = tk.project_id
+        LEFT JOIN {S}.clients  c  ON c.id = p.client_id
+        LEFT JOIN {S}.users    u  ON u.id::text = t.user_id::text
+    """
+    return dbconn.fetch(DW_NAME, query=sql, df=True)
+
+
+def update_entry(entry_id, values):
+    """Write straight to ts_prod.timetable. Callers must pass real Python
+    bools/ints - the write proxy runs string values through Decimal(), so
+    e.g. "true" for a boolean column comes back as a 400."""
+    dbconn = pq.dbconnect(DW_NAME)
+    dbconn.update(DW_NAME, S, "timetable", int(entry_id), values)
+
+
+raw_df = load_entries()
+
+if raw_df.empty:
     st.warning("No timesheet data found.")
     st.stop()
 
-df["entry_date"] = pd.to_datetime(df["entry_date"])
-df["hours"] = df["duration"].astype(float) / 60.0
-df["approved"] = df["approved"].apply(is_true)
-df["billable"] = df["billable"].apply(is_true)
-df["month"] = df["entry_date"].dt.to_period("M").dt.to_timestamp()
-df["project_name"] = df["project_name"].fillna("(no project)")
-df["client_name"] = df["client_name"].fillna("(no client)")
-df["task_name"] = df["task_name"].fillna("(no task)")
-df["user_name"] = df["user_name"].fillna("(unknown employee)")
+df = prepare_df(raw_df)
 
 st.title("Project BI Dashboard")
 st.caption("Approval status (billable entries only) and project/task breakdowns, based on logged timesheet entries.")
@@ -213,50 +265,112 @@ with tab_approval:
 # =====================================================
 
 with tab_explorer:
-    col1, col2 = st.columns(2)
-    with col1:
-        explorer_month = st.selectbox(
-            "Month", [ALL_MONTHS] + list(month_values), format_func=lambda m: m if m == ALL_MONTHS else month_label(m),
-            key="explorer_month",
-        )
-    with col2:
-        explorer_client = st.selectbox(
-            "Client", [ALL_CLIENTS] + sorted(df["client_name"].unique().tolist()), key="explorer_client"
-        )
+    live_raw = load_live_entries()
 
-    scoped = df
-    if explorer_month != ALL_MONTHS:
-        scoped = scoped[scoped["month"] == explorer_month]
-    if explorer_client != ALL_CLIENTS:
-        scoped = scoped[scoped["client_name"] == explorer_client]
-
-    if scoped.empty:
-        st.info("No entries match the selected filters.")
+    if live_raw.empty:
+        st.info("No timesheet entries found.")
     else:
-        client_expanded = explorer_client != ALL_CLIENTS
-        for client, client_df in scoped.groupby("client_name", sort=True):
-            client_total = len(client_df)
-            client_approved = int(client_df["approved"].sum())
-            client_label = f"{client} — {client_approved}/{client_total} approved"
-            with st.expander(client_label, expanded=client_expanded):
-                for project, project_df in client_df.groupby("project_name", sort=True):
-                    proj_total = len(project_df)
-                    proj_approved = int(project_df["approved"].sum())
-                    st.markdown(f"**{project}** — {proj_approved}/{proj_total} approved")
-                    entries = project_df.sort_values(["task_name", "entry_date"])
-                    st.dataframe(
-                        entries[
-                            ["task_name", "entry_date", "user_name", "hours", "billable", "approved"]
-                        ].round({"hours": 1}),
-                        use_container_width=True,
-                        hide_index=True,
-                        column_config={
-                            "task_name": "Task",
-                            "entry_date": "Date",
-                            "user_name": "Employee",
-                            "hours": "Hours",
-                            "billable": "Billable",
-                            "approved": "Approved",
-                        },
-                    )
-                    st.divider()
+        live_df = prepare_df(live_raw)
+        explorer_months = sorted(live_df["month"].dropna().unique(), reverse=True)
+
+        st.caption(
+            "Entries here are live from ts_prod, not the reporting table - "
+            "edits below take effect immediately. Hours and Approved are "
+            "editable; everything else is read-only."
+        )
+
+        col1, col2 = st.columns(2)
+        with col1:
+            explorer_month = st.selectbox(
+                "Month", [ALL_MONTHS] + list(explorer_months),
+                format_func=lambda m: m if m == ALL_MONTHS else month_label(m),
+                key="explorer_month",
+            )
+        with col2:
+            explorer_client = st.selectbox(
+                "Client", [ALL_CLIENTS] + sorted(live_df["client_name"].unique().tolist()),
+                key="explorer_client",
+            )
+
+        scoped = live_df
+        if explorer_month != ALL_MONTHS:
+            scoped = scoped[scoped["month"] == explorer_month]
+        if explorer_client != ALL_CLIENTS:
+            scoped = scoped[scoped["client_name"] == explorer_client]
+
+        if scoped.empty:
+            st.info("No entries match the selected filters.")
+        else:
+            client_expanded = explorer_client != ALL_CLIENTS
+            for client, client_df in scoped.groupby("client_name", sort=True):
+                client_total = len(client_df)
+                client_approved = int(client_df["approved"].sum())
+                client_label = f"{client} — {client_approved}/{client_total} approved"
+                with st.expander(client_label, expanded=client_expanded):
+                    for project, project_df in client_df.groupby("project_name", sort=True):
+                        proj_total = len(project_df)
+                        proj_approved = int(project_df["approved"].sum())
+                        st.markdown(f"**{project}** — {proj_approved}/{proj_total} approved")
+
+                        entries = (
+                            project_df.sort_values(["task_name", "entry_date"])
+                            .reset_index(drop=True)
+                        )
+                        display_df = entries[
+                            ["entry_id", "task_name", "entry_date", "user_name",
+                             "hours", "billable", "approved"]
+                        ].copy()
+                        display_df["entry_date"] = display_df["entry_date"].dt.strftime("%Y-%m-%d")
+                        display_df["hours"] = display_df["hours"].round(2)
+
+                        editor_key = f"editor_{client}_{project}"
+                        edited = st.data_editor(
+                            display_df,
+                            key=editor_key,
+                            use_container_width=True,
+                            hide_index=True,
+                            num_rows="fixed",
+                            disabled=["entry_id", "task_name", "entry_date", "user_name", "billable"],
+                            column_config={
+                                "entry_id": "ID",
+                                "task_name": "Task",
+                                "entry_date": "Date",
+                                "user_name": "Employee",
+                                "hours": "Hours",
+                                "billable": "Billable",
+                                "approved": "Approved",
+                            },
+                        )
+
+                        if st.button("Save changes", key=f"save_{editor_key}"):
+                            changes = {}
+                            for i in range(len(entries)):
+                                entry_id = int(entries.loc[i, "entry_id"])
+                                orig_hours = round(float(entries.loc[i, "hours"]), 2)
+                                orig_approved = bool(entries.loc[i, "approved"])
+                                new_hours = round(float(edited.loc[i, "hours"]), 2)
+                                new_approved = bool(edited.loc[i, "approved"])
+
+                                updates = {}
+                                if new_hours != orig_hours:
+                                    if new_hours <= 0:
+                                        st.warning(f"Entry {entry_id}: hours must be positive, skipped.")
+                                    else:
+                                        updates["duration"] = int(round(new_hours * 60))
+                                if new_approved != orig_approved:
+                                    updates["approved"] = new_approved
+
+                                if updates:
+                                    changes[entry_id] = updates
+
+                            if not changes:
+                                st.info("No changes to save.")
+                            else:
+                                for entry_id, updates in changes.items():
+                                    update_entry(entry_id, updates)
+                                load_live_entries.clear()
+                                plural = "y" if len(changes) == 1 else "ies"
+                                st.success(f"Saved {len(changes)} entr{plural}.")
+                                st.rerun()
+
+                        st.divider()
