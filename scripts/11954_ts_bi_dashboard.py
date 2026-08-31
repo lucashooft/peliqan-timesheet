@@ -259,7 +259,7 @@ with tab_approval:
                         f"({row['approved_hours']:.1f}/{row['total_hours']:.1f}h)"
                     )
 
-                with st.expander(label, key=f"approval_expander_{selected_month}_{client}"):
+                with st.expander(label):
                     unapproved = month_df[
                         (month_df["client_name"] == client) & (~month_df["approved"])
                     ].sort_values(["entry_date", "user_name"])
@@ -315,19 +315,6 @@ with tab_explorer:
                 key="explorer_client",
             )
 
-        # Client expanders below are keyed widgets, so once a user manually
-        # opens/closes one, Streamlit remembers that across reruns instead
-        # of us re-forcing a value every time (that was the bug: passing a
-        # freshly computed expanded= on every rerun - including ones caused
-        # just by editing a table cell - snapped expanders shut mid-edit).
-        # The only time we WANT to override the user's choice is when the
-        # client filter itself changes, to re-apply auto-expand-on-filter.
-        if st.session_state.get("_explorer_client_seen") != explorer_client:
-            for k in list(st.session_state.keys()):
-                if k.startswith("explorer_client_expander_"):
-                    del st.session_state[k]
-            st.session_state["_explorer_client_seen"] = explorer_client
-
         scoped = live_df
         if explorer_month != ALL_MONTHS:
             scoped = scoped[scoped["month"] == explorer_month]
@@ -342,10 +329,7 @@ with tab_explorer:
                 client_total = len(client_df)
                 client_approved = int(client_df["approved"].sum())
                 client_label = f"{client} — {client_approved}/{client_total} approved"
-                with st.expander(
-                    client_label, expanded=client_expanded,
-                    key=f"explorer_client_expander_{client}",
-                ):
+                with st.expander(client_label, expanded=client_expanded):
                     for project, project_df in client_df.groupby("project_name", sort=True):
                         proj_total = len(project_df)
                         proj_approved = int(project_df["approved"].sum())
@@ -362,26 +346,32 @@ with tab_explorer:
                         display_df["entry_date"] = display_df["entry_date"].dt.strftime("%Y-%m-%d")
                         display_df["hours"] = display_df["hours"].round(2)
 
+                        # A plain st.data_editor reruns the whole script on every
+                        # cell edit, which was re-evaluating expanded= above and
+                        # snapping expanders shut mid-edit. Wrapping it in a form
+                        # defers that rerun until Save is actually clicked.
                         editor_key = f"editor_{client}_{project}"
-                        edited = st.data_editor(
-                            display_df,
-                            key=editor_key,
-                            width='stretch',
-                            hide_index=True,
-                            num_rows="fixed",
-                            disabled=["entry_id", "task_name", "entry_date", "user_name", "billable"],
-                            column_config={
-                                "entry_id": "ID",
-                                "task_name": "Task",
-                                "entry_date": "Date",
-                                "user_name": "Employee",
-                                "hours": "Hours",
-                                "billable": "Billable",
-                                "approved": "Approved",
-                            },
-                        )
+                        with st.form(f"form_{editor_key}", clear_on_submit=False):
+                            edited = st.data_editor(
+                                display_df,
+                                key=editor_key,
+                                width='stretch',
+                                hide_index=True,
+                                num_rows="fixed",
+                                disabled=["entry_id", "task_name", "entry_date", "user_name", "billable"],
+                                column_config={
+                                    "entry_id": "ID",
+                                    "task_name": "Task",
+                                    "entry_date": "Date",
+                                    "user_name": "Employee",
+                                    "hours": "Hours",
+                                    "billable": "Billable",
+                                    "approved": "Approved",
+                                },
+                            )
+                            submitted = st.form_submit_button("Save changes")
 
-                        if st.button("Save changes", key=f"save_{editor_key}"):
+                        if submitted:
                             changes = {}
                             for i in range(len(entries)):
                                 entry_id = int(entries.loc[i, "entry_id"])
