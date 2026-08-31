@@ -454,6 +454,6 @@ with tab_overview:
 
         st.dataframe(
             filtered_df,
-            use_container_width=True,
+            width='stretch',
             hide_index=True
         )

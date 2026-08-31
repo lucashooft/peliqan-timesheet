@@ -968,7 +968,7 @@ def export_dialog(can_manage, user_ids, user_by_id, default_month):
                                else user_display_name(user_by_id[w])),
     )
 
-    if st.button("Create export", type="primary", use_container_width=True,
+    if st.button("Create export", type="primary", width='stretch',
                  key="export_build"):
         try:
             with st.spinner("Updating the view and collecting entries..."):
@@ -1000,7 +1000,7 @@ def export_dialog(can_manage, user_ids, user_by_id, default_month):
     st.download_button(
         f"Download {fname}", data=data, file_name=fname,
         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-        type="primary", use_container_width=True, key="export_download",
+        type="primary", width='stretch', key="export_download",
     )
 
 
@@ -1073,7 +1073,7 @@ def add_dialog(user_id, day, lookup, default_start=time(9, 0)):
     ready = task_id is not None or bool(
         new_task and new_task["project_id"] is not None and new_task["name"].strip())
     label = "Save" if task_id is not None else "Create task and save"
-    if st.button(label, type="primary", use_container_width=True, key="add_save",
+    if st.button(label, type="primary", width='stretch', key="add_save",
                  disabled=not ready):
         entry_dt = datetime.combine(day, start)
         # The slot is checked FIRST, before any task is created: a refused
@@ -1125,7 +1125,7 @@ def entry_dialog(entry, lookup, editable, user_id):
         new_note = st.text_area("Note", value=entry.get("internal_description") or "",
                                 key=dialog_key("edit_note"), height=80)
         s1, s2 = st.columns(2)
-        if s1.form_submit_button("Save", type="primary", use_container_width=True,
+        if s1.form_submit_button("Save", type="primary", width='stretch',
                                  disabled=task_id is None):
             new_dt = datetime.combine(new_day, new_start)
             # Compared at minute precision: the widget drops seconds, so a
@@ -1140,7 +1140,7 @@ def entry_dialog(entry, lookup, editable, user_id):
                 st.error(error)
             else:
                 st.rerun()
-        if s2.form_submit_button("Delete", use_container_width=True):
+        if s2.form_submit_button("Delete", width='stretch'):
             delete_entry(entry["id"])
             st.rerun()
 
@@ -1159,12 +1159,12 @@ def submit_dialog(user_id, week_start, day_totals):
             st.markdown(f"{DAY_ABBREV[i]} - {fmt_dur(total)} - **missing {fmt_dur(DAY_TARGET_MIN - total)}**")
     st.caption("Submitting locks the week for editing until it is unsubmitted or validated.")
     if not shortfalls:
-        if st.button("Submit week", type="primary", use_container_width=True, key="submit_ok"):
+        if st.button("Submit week", type="primary", width='stretch', key="submit_ok"):
             submit_week(user_id, week_start)
             st.rerun()
     else:
         st.warning("Not every workday reaches the 8h minimum yet.")
-        if st.button("Submit anyway", use_container_width=True, key="submit_anyway"):
+        if st.button("Submit anyway", width='stretch', key="submit_anyway"):
             submit_week(user_id, week_start)
             st.rerun()
 
@@ -1178,7 +1178,7 @@ def validate_dialog(target_user, week_start, validated_by_id, existing_submissio
     )
     st.caption("This validates every entry in the week and marks the submission "
                "as confirmed. Validated entries can no longer be edited by anyone.")
-    if st.button("Validate week", type="primary", use_container_width=True, key="validate_ok"):
+    if st.button("Validate week", type="primary", width='stretch', key="validate_ok"):
         validate_week(to_int(target_user.get("id")), week_start, validated_by_id, existing_submission)
         st.rerun()
 
@@ -1759,9 +1759,9 @@ is_self = viewing_id == viewer_id
 # The account collapses into a popover: a strip of its own above the
 # filters cost a whole row of height for two small things. The name is the
 # label, the address and Sign out live inside.
-with acct_col.popover(auth["name"], use_container_width=True):
+with acct_col.popover(auth["name"], width='stretch'):
     st.caption(auth["email"])
-    if st.button("Sign out", key="sign_out", use_container_width=True):
+    if st.button("Sign out", key="sign_out", width='stretch'):
         end_session(cookies)
         st.rerun()
 
@@ -1769,7 +1769,7 @@ with acct_col.popover(auth["name"], use_container_width=True):
 # in the week grid. Managers only - scope 1 never sees the button.
 # Everything else happens in the dialog.
 if can_manage and export_col.button("Export to Excel", key="open_export",
-                                    use_container_width=True):
+                                    width='stretch'):
     export_dialog(can_manage, user_ids, user_by_id,
                   date(st.session_state.week_start.year,
                        st.session_state.week_start.month, 1))
@@ -1920,13 +1920,13 @@ if pending:
 prev_col, next_col, this_col, title_col, validate_col, submit_col = st.columns(
     [1.15, 1.0, 1.0, 2.85, 2.0, 2.0])
 
-if prev_col.button("Previous week", key="prev_week", use_container_width=True):
+if prev_col.button("Previous week", key="prev_week", width='stretch'):
     go_to_week(week_start - timedelta(days=7))
-if next_col.button("Next week", key="next_week", use_container_width=True):
+if next_col.button("Next week", key="next_week", width='stretch'):
     go_to_week(week_start + timedelta(days=7))
 this_week = monday_of(date.today())
 if week_start != this_week:
-    if this_col.button("This week", key="this_week", use_container_width=True):
+    if this_col.button("This week", key="this_week", width='stretch'):
         go_to_week(this_week)
 
 iso_week = week_start.isocalendar()[1]
@@ -1945,15 +1945,15 @@ if is_confirmed:
     validate_col.success("Week validated" + (f" by {user_display_name(by)}" if by else ""))
 elif wk_status == "submitted":
     if can_validate and validate_col.button("Validate", key="validate_btn",
-                                            type="primary", use_container_width=True):
+                                            type="primary", width='stretch'):
         validate_dialog(viewing_user, week_start, viewer_id, submission)
     if can_unsubmit and submit_col.button("Unsubmit", key="unsubmit_btn",
-                                          use_container_width=True):
+                                          width='stretch'):
         unsubmit_week(viewing_id, week_start)
         st.rerun()
 elif can_edit:
     if submit_col.button("Submit week", key="submit_week_btn",
-                         type="primary", use_container_width=True):
+                         type="primary", width='stretch'):
         submit_dialog(viewing_id, week_start, day_totals)
 else:
     submit_col.caption("Week not submitted yet.")
@@ -1987,7 +1987,7 @@ for i, d in enumerate(days):
         if can_edit:
             if st.button("Add an entry", key=f"add_day_{d.isoformat()}",
                          help=f"Add an entry on {d.strftime('%a %d %b')}",
-                         use_container_width=True):
+                         width='stretch'):
                 open_dialog()
                 add_dialog(viewing_id, d, lookup)
         
@@ -2093,7 +2093,7 @@ fig.update_layout(
 
 event = st.plotly_chart(
     fig,
-    use_container_width=True,
+    width='stretch',
     on_select="rerun",
     selection_mode="points",
     key=f"cal_{st.session_state.cal_nonce}",
@@ -2131,7 +2131,7 @@ if untimed:
         info = lookup.get(to_int(e.get("task_id")), LOOKUP_DEFAULT)
         lock = " (locked)" if is_true(e.get("approved")) else ""
         lbl = f"{e['dt'].strftime('%a %d')} - {fmt_dur(e['duration'])} - {info['client']}{lock}"
-        if u_cols[j % len(u_cols)].button(lbl, key=f"u_{e['id']}", use_container_width=True):
+        if u_cols[j % len(u_cols)].button(lbl, key=f"u_{e['id']}", width='stretch'):
             open_dialog()
             entry_dialog(e, lookup, editable=can_edit and not is_true(e.get("approved")),
                          user_id=viewing_id)

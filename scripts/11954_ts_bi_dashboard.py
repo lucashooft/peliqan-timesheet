@@ -229,7 +229,7 @@ with tab_approval:
                 total = int(row["total"])
                 approved = int(row["approved"])
                 if row["fully_approved"]:
-                    label = f"✅ {client} — APPROVED ({total} entries, {row['total_hours']:.1f}h)"
+                    label = f"{client} — APPROVED ({total} entries, {row['total_hours']:.1f}h)"
                 else:
                     label = (
                         f"{client} — {approved}/{total} approved "
@@ -248,7 +248,7 @@ with tab_approval:
                                 ["entry_date", "project_name", "task_name", "user_name",
                                  "hours", "task_status"]
                             ].round({"hours": 1}),
-                            use_container_width=True,
+                            width='stretch',
                             hide_index=True,
                             column_config={
                                 "entry_date": "Date",
@@ -327,7 +327,7 @@ with tab_explorer:
                         edited = st.data_editor(
                             display_df,
                             key=editor_key,
-                            use_container_width=True,
+                            width='stretch',
                             hide_index=True,
                             num_rows="fixed",
                             disabled=["entry_id", "task_name", "entry_date", "user_name", "billable"],
