@@ -64,7 +64,8 @@ TEAM_LEAD_SCOPE = 2
 # Restrict monitoring + all Slack DMs to only these people (matched against
 # ts_prod.users.name). Set to None to include everyone with name+email+scope
 # set (the previous, unrestricted behavior).
-NOTIFY_ONLY = ["Lucas", "Sander", "Piet-Michiel"]
+NOTIFY_ONLY = ["Lucas", "Arthur"]
+#["Lucas", "Sander", "Piet-Michiel", "Arthur Haus"]
 
 
 # Maps ts_prod.users.name -> real Slack username, for anyone whose Slack
@@ -73,7 +74,7 @@ NOTIFY_ONLY = ["Lucas", "Sander", "Piet-Michiel"]
 SLACK_USERNAME_OVERRIDES = {}
 
 # Only shortfall days on/after this date are tracked/notified.
-FIXED_START_DATE = date(2026, 8, 17)
+FIXED_START_DATE = date(2026, 8, 28)
 SLACK_CONNECTION_NAME = "Slack"
 WORKDAY_MINUTES = 480
 DAILY_THRESHOLD_MINUTES = WORKDAY_MINUTES
@@ -156,7 +157,7 @@ else:
     roster_rows = fetch_with_retry(dbconn, roster_query, "Roster query")
 
     USER_LIST = [row["name"] for row in roster_rows]
-    TEAM_LEADS = [row["name"] for row in roster_rows if row["scope"] == TEAM_LEAD_SCOPE]
+    TEAM_LEADS = [row["name"] for row in roster_rows if row["scope"] >= TEAM_LEAD_SCOPE]
 
     if NOTIFY_ONLY is not None:
         USER_LIST = [u for u in USER_LIST if u in NOTIFY_ONLY]
