@@ -281,6 +281,17 @@ def build_cells(user_ids, days, schedule, projects):
                          "color": color, "text": text, "hover": hover})
     return cells
 
+
+def build_occupancy(user_ids, days, schedule):
+    """{user_id: 0-100} - the % of this window's workdays that have a
+    project planned, i.e. how full this employee's 4-week window is."""
+    occ = {}
+    for uid in user_ids:
+        planned = sum(1 for d in days
+                     if (schedule.get((uid, d)) or {}).get("project_id") is not None)
+        occ[uid] = round(100 * planned / len(days)) if days else 0
+    return occ
+
 # =====================================================
 # State
 # =====================================================
@@ -348,8 +359,9 @@ def assign_dialog(user_id, day, employee_name, projects, current_project_id, cur
 
 st.title("Team planner")
 st.caption("One row per employee, one block per workday - click a block to plan "
-          "which project they're on. This is a standalone schedule, not a copy "
-          "of logged hours.")
+          "which project they're on. The % after each name is how much of this "
+          "4-week window has a project planned. This is a standalone schedule, "
+          "not a copy of logged hours.")
 
 users = load_users()
 if not users:
@@ -438,6 +450,7 @@ else:
 n_rows = len(display_users)
 row_of = {uid: i for i, uid in enumerate(user_ids)}
 cells = build_cells(user_ids, days, schedule, projects)
+occupancy = build_occupancy(user_ids, days, schedule)
 
 fig = go.Figure()
 fig.add_trace(go.Bar(
@@ -486,7 +499,8 @@ fig.update_layout(
     yaxis=dict(
         range=[n_rows, 0],
         tickvals=[i + 0.5 for i in range(n_rows)],
-        ticktext=[user_display_name(u) for u in display_users],
+        ticktext=[f"{user_display_name(u)} ({occupancy[to_int(u['id'])]}%)"
+                 for u in display_users],
         fixedrange=True, zeroline=False, showline=False, ticks="",
         gridcolor="#eeeeef", gridwidth=1, dtick=1,
         tickfont=dict(size=11, color="#3c4043"),
