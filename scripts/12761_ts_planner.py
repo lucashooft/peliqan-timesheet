@@ -19,23 +19,30 @@ else:  # Running outside of Peliqan
         RUN_CONTEXT = "background"
 
 """
-ts_planner (v1) - team resourcing overview.
+ts_planner (v2) - team resourcing SCHEDULE, standalone from actuals.
 
-Read-only, styled to feel like ts_my_week's calendar. One row per
-employee, WINDOW_DAYS blocks per row - the last 4 workweeks (Mon-Fri) by
-default, navigable in 4-week jumps - each block colored by whichever
-project that day's logged hours went to. A day split between two
-projects splits its block the same proportion, sorted biggest project
-first; a day with nothing logged stays a blank cell.
+One row per employee, WINDOW_DAYS blocks per row - the last 4 workweeks
+(Mon-Fri) by default, navigable in 4-week jumps - each block colored by
+the project PLANNED for that employee that day. Click any block to
+assign, change or clear its project.
+
+Deliberately NOT derived from ts_prod.timetable (logged hours): this is
+its own plan, stored in ts_prod.planned_assignments, so it can later be
+compared against what was actually logged instead of just echoing it.
+That comparison is a follow-up, not built here yet.
+
+ts_prod.planned_assignments does not exist until the first assignment is
+saved - dbconn.write() auto-creates it (see save_assignment below), so a
+brand new install shows an all-empty grid rather than an error.
 
 No login, no scope check - same as every Data App in this repo except
 12011_ts_my_week and 11383_ts_mcp_server (see CLAUDE.md). Anyone who can
-open the app sees every employee's window.
+open the app can see and edit every employee's schedule.
 
-Data (all read-only):
-  - ts_prod.users                  employee list
-  - ts_prod.timetable              logged entries in the visible window
-  - ts_prod.tasks/projects/clients lookups (project name, color)
+Data:
+  - ts_prod.users                read-only (employee list)
+  - ts_prod.projects/clients     read-only lookups (names, legend)
+  - ts_prod.planned_assignments  read + write (this app's own table)
 
 NOTE: st.set_page_config must stay a literal string - the Peliqan runtime
 lifts that call into a system prepend that runs before this script body.
@@ -44,7 +51,7 @@ lifts that call into a system prepend that runs before this script body.
 import plotly.graph_objects as go
 import pandas as pd
 import streamlit as st
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta
 
 st.set_page_config(page_title="Team planner", layout="wide")
 
@@ -57,6 +64,7 @@ st.markdown("<style>.block-container{padding-top:2.2rem;}</style>",
 
 DW_NAME = "dw_3202"
 S = "ts_prod"
+SCHEDULE_TABLE = "planned_assignments"
 
 WORKDAYS_PER_WEEK = 5
 WEEKS_IN_WINDOW = 4
@@ -66,15 +74,15 @@ DAY_ABBREV = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]
 ROW_PX = 34
 
 # Cycled by project_id, the same way ts_my_week cycles CLIENT_COLORS by
-# client_id - two employees on the same project always land on the same
-# color without a shared color table to keep in sync.
+# client_id - two employees planned on the same project always land on
+# the same color without a shared color table to keep in sync.
 PROJECT_COLORS = ["#4c78a8", "#54a24b", "#b279a2", "#f58518", "#e45756",
                   "#eeca3b", "#9d755d", "#72b7b2", "#ff9da6", "#1b9e77",
                   "#7570b3", "#bab0ac"]
 
 EMPTY_CELL_COLOR = "#f5f6f8"
-LOOKUP_DEFAULT = {"project": "?", "project_id": 0, "client": "-",
-                  "color": "#9d9da6"}
+# Stand-in for a plan pointing at a project that no longer exists.
+DEFAULT_PROJECT = {"project": "?", "client": "-", "color": "#9d9da6"}
 
 # =====================================================
 # Helpers
@@ -85,16 +93,6 @@ def to_int(v):
         return int(float(v))
     except (TypeError, ValueError):
         return None
-
-
-def fmt_dur(minutes):
-    minutes = int(minutes or 0)
-    h, m = divmod(minutes, 60)
-    if h and m:
-        return f"{h}h{m:02d}"
-    if h:
-        return f"{h}h"
-    return f"{m}m"
 
 
 def monday_of(d):
@@ -122,86 +120,119 @@ def load_users():
 
 
 @st.cache_data(ttl=300)
-def load_task_lookup():
-    """{task_id: {project, project_id, client, color}}."""
+def load_projects():
+    """{project_id: {project, client, color}} - the choices in the assign
+    dialog and the labels/colors on the grid."""
     dbconn = pq.dbconnect(DW_NAME)
     rows = dbconn.fetch(DW_NAME, query=f"""
-        SELECT t.id AS task_id, t.project_id,
-               COALESCE(p.name, '-') AS project,
+        SELECT p.id AS project_id, p.name AS project,
                COALESCE(c.name, '-') AS client
-        FROM {S}.tasks t
-        LEFT JOIN {S}.projects p ON p.id = t.project_id
-        LEFT JOIN {S}.clients  c ON c.id = p.client_id
+        FROM {S}.projects p
+        LEFT JOIN {S}.clients c ON c.id = p.client_id
     """) or []
-    lookup = {}
+    out = {}
     for r in rows:
-        tid = to_int(r.get("task_id"))
-        if tid is None:
+        pid = to_int(r.get("project_id"))
+        if pid is None:
             continue
-        pid = to_int(r.get("project_id")) or 0
-        lookup[tid] = {
+        out[pid] = {
             "project": r.get("project") or f"Project {pid}",
-            "project_id": pid,
             "client": r.get("client") or "-",
             "color": PROJECT_COLORS[pid % len(PROJECT_COLORS)],
         }
-    return lookup
+    return out
 
 
 @st.cache_data(ttl=60)
-def load_window_entries(start_date, end_date):
-    """Every logged entry across ALL employees in [start_date, end_date]."""
+def load_schedule(start_date, end_date):
+    """{(user_id, date): {project_id, note}} for every planned assignment
+    in [start_date, end_date]. planned_assignments does not exist until
+    the first save_assignment() call, so a missing table reads as
+    "nothing planned yet" rather than an error."""
     dbconn = pq.dbconnect(DW_NAME)
-    rows = dbconn.fetch(DW_NAME, query=f"""
-        SELECT user_id, task_id, date, duration
-        FROM {S}.timetable
-        WHERE date >= '{start_date.isoformat()}'
-          AND date <  '{(end_date + timedelta(days=1)).isoformat()}'
-    """) or []
-    df = pd.DataFrame(rows)
-    if df.empty:
-        return df
-    df["day"] = pd.to_datetime(df["date"], errors="coerce").dt.date
-    df["duration"] = pd.to_numeric(df["duration"], errors="coerce").fillna(0).astype(int)
-    df["user_id"] = df["user_id"].apply(to_int)
-    df["task_id"] = df["task_id"].apply(to_int)
-    return df.dropna(subset=["day"])
+    try:
+        rows = dbconn.fetch(DW_NAME, query=f"""
+            SELECT user_id, date, project_id, note
+            FROM {S}.{SCHEDULE_TABLE}
+            WHERE date >= '{start_date.isoformat()}' AND date <= '{end_date.isoformat()}'
+        """) or []
+    except Exception:
+        return {}
+    out = {}
+    for r in rows:
+        uid = to_int(r.get("user_id"))
+        try:
+            d = date.fromisoformat(str(r.get("date"))[:10])
+        except ValueError:
+            continue
+        if uid is None:
+            continue
+        out[(uid, d)] = {"project_id": to_int(r.get("project_id")),
+                         "note": r.get("note") or ""}
+    return out
+
+# =====================================================
+# Writes
+# =====================================================
+
+def save_assignment(user_id, day, project_id, note):
+    """
+    Plan `user_id` onto `project_id` for `day`, or move an existing plan
+    to a different project - the same call either way.
+
+    dbconn.write() creates ts_prod.planned_assignments on the very first
+    call (inferring columns from these fields) and upserts on every call
+    after, keyed on pk=["user_id", "date"] - exactly the one-project-
+    per-employee-per-day rule this grid assumes, so no separate
+    create_table step is needed.
+    """
+    dbconn = pq.dbconnect(DW_NAME)
+    dbconn.write(S, SCHEDULE_TABLE, [{
+        "user_id": int(user_id),
+        "date": day.isoformat(),
+        "project_id": int(project_id),
+        "note": (note or "").strip(),
+        "updated_at": datetime.utcnow().isoformat(),
+    }], pk=["user_id", "date"], db_name=DW_NAME)
+    load_schedule.clear()
+
+
+def clear_assignment(user_id, day):
+    dbconn = pq.dbconnect(DW_NAME)
+    try:
+        dbconn.execute(DW_NAME, query=(
+            f"DELETE FROM {S}.{SCHEDULE_TABLE} "
+            f"WHERE user_id = {int(user_id)} AND date = '{day.isoformat()}'"))
+    except Exception:
+        pass
+    load_schedule.clear()
 
 # =====================================================
 # Grid model (pure function -> unit-testable)
 # =====================================================
 
-def build_cells(user_ids, days, entries_df, lookup):
+def build_cells(user_ids, days, schedule, projects):
     """
-    [{user_id, day_i, y0, y1, color, project, client, minutes}, ...]
-
-    y0/y1 are fractions of ONE row (0..1): a day worked on a single
-    project fills the whole block for that day, a day split between two
-    projects splits the block the same proportion - sorted biggest first
-    so the dominant project always starts at the top.
+    One record per (user, day) cell, in row/day order - a plotted project
+    block where one is planned, an empty/clickable block otherwise.
     """
-    if entries_df.empty:
-        return []
-    day_index = {d: i for i, d in enumerate(days)}
-    scoped = entries_df[entries_df["user_id"].isin(user_ids)
-                        & entries_df["day"].isin(day_index)]
     cells = []
-    for (uid, day), day_rows in scoped.groupby(["user_id", "day"]):
-        agg = {}
-        for _, r in day_rows.iterrows():
-            info = lookup.get(r["task_id"], LOOKUP_DEFAULT)
-            key = (info["project"], info["client"], info["color"])
-            agg[key] = agg.get(key, 0) + int(r["duration"])
-        day_total = sum(agg.values())
-        if day_total <= 0:
-            continue
-        y0 = 0.0
-        for (project, client, color), minutes in sorted(agg.items(), key=lambda kv: -kv[1]):
-            y1 = y0 + minutes / day_total
-            cells.append({"user_id": uid, "day_i": day_index[day], "y0": y0, "y1": y1,
-                         "color": color, "project": project, "client": client,
-                         "minutes": minutes})
-            y0 = y1
+    for uid in user_ids:
+        for day_i, d in enumerate(days):
+            rec = schedule.get((uid, d))
+            pid = rec.get("project_id") if rec else None
+            if pid is not None:
+                info = projects.get(pid, DEFAULT_PROJECT)
+                color, text = info["color"], info["project"]
+                hover = f"<b>{info['client']}</b> - {info['project']}"
+                if rec.get("note"):
+                    hover += f"<br><i>{rec['note']}</i>"
+                hover += "<br>Click to change"
+            else:
+                color, text = EMPTY_CELL_COLOR, ""
+                hover = "Click to plan a project"
+            cells.append({"user_id": uid, "day_i": day_i, "project_id": pid,
+                         "color": color, "text": text, "hover": hover})
     return cells
 
 # =====================================================
@@ -212,17 +243,67 @@ DEFAULT_START = monday_of(date.today()) - timedelta(weeks=WEEKS_IN_WINDOW - 1)
 
 if "planner_start" not in st.session_state:
     st.session_state.planner_start = DEFAULT_START
+if "grid_nonce" not in st.session_state:
+    st.session_state.grid_nonce = 0
+if "dialog_token" not in st.session_state:
+    st.session_state.dialog_token = 0
+if "pending" not in st.session_state:
+    st.session_state.pending = None
+
+# =====================================================
+# Dialog helpers
+#
+# DUPLICATED from ts_my_week.py's dialog_key/open_dialog (Data Apps
+# cannot import each other - see CLAUDE.md). Keep the two in step.
+# =====================================================
+
+def dialog_key(name):
+    return f"{name}_{st.session_state.dialog_token}"
+
+
+def open_dialog():
+    st.session_state.dialog_token += 1
+
+
+@st.dialog("Plan a project")
+def assign_dialog(user_id, day, employee_name, projects, current_project_id, current_note):
+    st.caption(f"{employee_name} - {day.strftime('%A %d %B %Y')}")
+    ids = sorted(projects, key=lambda i: (projects[i]["client"], projects[i]["project"]))
+    if not ids:
+        st.warning("There are no projects to plan against yet.")
+        return
+    index = ids.index(current_project_id) if current_project_id in ids else None
+    project_id = st.selectbox(
+        "Project", ids, index=index, key=dialog_key("plan_project"),
+        placeholder="Choose a project...",
+        format_func=lambda i: f"{projects[i]['client']} - {projects[i]['project']}")
+    note = st.text_input("Note", value=current_note, key=dialog_key("plan_note"))
+
+    c1, c2 = st.columns(2)
+    if c1.button("Save", type="primary", width='stretch',
+                 disabled=project_id is None, key="plan_save"):
+        save_assignment(user_id, day, project_id, note)
+        st.rerun()
+    if current_project_id is not None and c2.button("Clear", width='stretch', key="plan_clear"):
+        clear_assignment(user_id, day)
+        st.rerun()
+
+# =====================================================
+# Page
+# =====================================================
 
 st.title("Team planner")
-st.caption("One row per employee, one block per workday - colored by whichever "
-          "project the logged hours that day went to.")
+st.caption("One row per employee, one block per workday - click a block to plan "
+          "which project they're on. This is a standalone schedule, not a copy "
+          "of logged hours.")
 
 users = load_users()
 if not users:
     st.warning("No users found - check ts_prod.users.")
     st.stop()
+user_by_id = {to_int(u["id"]): u for u in users}
 
-lookup = load_task_lookup()
+projects = load_projects()
 
 # ---- navigation ----
 nav_prev, nav_date, nav_next, nav_reset, search_col = st.columns(
@@ -260,17 +341,29 @@ if not display_users:
     st.stop()
 user_ids = [to_int(u["id"]) for u in display_users]
 
-entries_df = load_window_entries(days[0], days[-1])
-cells = build_cells(set(user_ids), days, entries_df, lookup)
-row_of = {uid: i for i, uid in enumerate(user_ids)}
+schedule = load_schedule(days[0], days[-1])
+
+# ---- open a dialog queued by a previous click ----
+pending, st.session_state.pending = st.session_state.pending, None
+if pending:
+    puid, pday = pending
+    puser = user_by_id.get(puid)
+    if puser is not None and pday in days:
+        rec = schedule.get((puid, pday)) or {}
+        open_dialog()
+        assign_dialog(puid, pday, user_display_name(puser), projects,
+                     rec.get("project_id"), rec.get("note", ""))
 
 # =====================================================
 # Legend
 # =====================================================
 
 seen = {}
-for c in cells:
-    seen.setdefault((c["client"], c["project"]), c["color"])
+for (uid, d), rec in schedule.items():
+    pid = rec.get("project_id")
+    if uid in user_ids and pid is not None and d in days:
+        info = projects.get(pid, DEFAULT_PROJECT)
+        seen.setdefault((info["client"], info["project"]), info["color"])
 
 if seen:
     chips = "".join(
@@ -282,46 +375,34 @@ if seen:
     )
     st.markdown(f"<div style='margin-bottom:0.4rem;'>{chips}</div>", unsafe_allow_html=True)
 else:
-    st.caption("No entries logged in this window yet.")
+    st.caption("Nothing planned in this window yet - click any block to start.")
 
 # =====================================================
 # The grid (Plotly, styled to match ts_my_week's calendar)
 # =====================================================
 
 n_rows = len(display_users)
+row_of = {uid: i for i, uid in enumerate(user_ids)}
+cells = build_cells(user_ids, days, schedule, projects)
+
 fig = go.Figure()
-
-# blank placeholder for every cell -> a visible grid even where nobody
-# logged anything, drawn first so the colored segments sit on top of it
 fig.add_trace(go.Bar(
-    x=[i for i in range(len(days))] * n_rows,
+    x=[c["day_i"] for c in cells],
     width=0.94,
-    base=[r for r in range(n_rows) for _ in days],
-    y=[1] * (n_rows * len(days)),
-    marker=dict(color=EMPTY_CELL_COLOR, line=dict(color="white", width=1)),
-    hoverinfo="skip",
+    base=[row_of[c["user_id"]] for c in cells],
+    y=[1] * len(cells),
+    marker=dict(color=[c["color"] for c in cells], line=dict(color="white", width=1)),
+    text=[c["text"] for c in cells],
+    textposition="inside",
+    insidetextanchor="middle",
+    textfont=dict(color="white", size=9,
+                  family="Source Sans Pro, Helvetica Neue, sans-serif"),
+    customdata=[[str(c["user_id"]), days[c["day_i"]].isoformat()] for c in cells],
+    hovertext=[c["hover"] for c in cells],
+    hovertemplate="%{hovertext}<extra></extra>",
     showlegend=False,
-    name="grid",
+    name="cells",
 ))
-
-if cells:
-    fig.add_trace(go.Bar(
-        x=[c["day_i"] for c in cells],
-        width=0.94,
-        base=[row_of[c["user_id"]] + c["y0"] for c in cells],
-        y=[c["y1"] - c["y0"] for c in cells],
-        marker=dict(color=[c["color"] for c in cells], line=dict(color="white", width=1)),
-        text=[c["project"] if (c["y1"] - c["y0"]) >= 0.22 else "" for c in cells],
-        textposition="inside",
-        insidetextanchor="middle",
-        textfont=dict(color="white", size=9,
-                      family="Source Sans Pro, Helvetica Neue, sans-serif"),
-        hovertext=[f"<b>{c['client']}</b> - {c['project']}<br>{fmt_dur(c['minutes'])}"
-                  for c in cells],
-        hovertemplate="%{hovertext}<extra></extra>",
-        showlegend=False,
-        name="entries",
-    ))
 
 for i, d in enumerate(days):
     if d == date.today():
@@ -338,6 +419,7 @@ fig.update_layout(
     barmode="overlay",
     barcornerradius=4,
     dragmode=False,
+    clickmode="event+select",
     font=dict(family="Source Sans Pro, Helvetica Neue, sans-serif"),
     xaxis=dict(
         range=[-0.5, len(days) - 0.5],
@@ -357,4 +439,23 @@ fig.update_layout(
     ),
 )
 
-st.plotly_chart(fig, width='stretch', config={"displayModeBar": False})
+event = st.plotly_chart(
+    fig, width='stretch', on_select="rerun", selection_mode="points",
+    key=f"grid_{st.session_state.grid_nonce}", config={"displayModeBar": False},
+)
+
+# ---- handle a click: queue the dialog, reset the chart selection ----
+points = (event.get("selection") or {}).get("points") or []
+if points:
+    cd = points[0].get("customdata")
+    if cd:
+        try:
+            clicked_uid = int(cd[0])
+            clicked_day = date.fromisoformat(str(cd[1]))
+        except (TypeError, ValueError, IndexError):
+            clicked_uid = None
+            clicked_day = None
+        if clicked_uid is not None and clicked_day is not None:
+            st.session_state.pending = (clicked_uid, clicked_day)
+            st.session_state.grid_nonce += 1
+            st.rerun()
