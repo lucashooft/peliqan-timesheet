@@ -35,14 +35,22 @@ find in one app holds anywhere else — check.
 
 ## Data model traps
 
+- **The warehouse runs on Baserow under the hood** (confirmed by a leaked error
+  stack trace: `/baserow/backend/src/baserow/...`). Table names get resolved
+  through Baserow's own catalog, not just checked for physical existence — a
+  raw `CREATE TABLE` via `dbconn.execute()` reaches the underlying Postgres
+  but Baserow never learns about it, so `insert`/`update`/`upsert`/`fetch`
+  against that table still 404 as `ERROR_TABLE_DOES_NOT_EXIST`. Only
+  `dbconn.create_table(db_name, schema_name, table_name, fields=[{"name":...,
+  "type":...}], pk=[...])` registers a new table both places. `dbconn.write()`
+  /`write_records` doesn't either — despite looking like an auto-create path,
+  it left nothing queryable. Don't reach for either shortcut again.
 - **`ts_prod.planned_assignments` is a standalone schedule, not derived from
-  `timetable`.** `12761_ts_planner` runs a `CREATE TABLE IF NOT EXISTS` before
-  every `dbconn.upsert`, keyed on a synthetic `id` = `f"{user_id}_{date}"` —
-  the same shape `ts_my_week` uses for `timetable_submissions`. (`dbconn.write()`
-  /`write_records` looked like it should auto-create the table on first write;
-  it didn't, so don't reach for that again without verifying it actually lands
-  a table.) It is deliberately NOT compared against logged hours yet; that
-  comparison is a known follow-up, not built.
+  `timetable`.** `12761_ts_planner` calls `dbconn.create_table()` (see above)
+  before every `dbconn.upsert`, keyed on a synthetic `id` = `f"{user_id}_
+  {date}"` — the same shape `ts_my_week` uses for `timetable_submissions`. It
+  is deliberately NOT compared against logged hours yet; that comparison is a
+  known follow-up, not built.
 - **`dbconn.update`/`insert` run string values through `Decimal()`.** Passing
   `"true"` for a boolean column returns a 400 with
   `[<class 'decimal.ConversionSyntax'>]`. Always pass real Python bools.

@@ -32,12 +32,12 @@ compared against what was actually logged instead of just echoing it.
 That comparison is a follow-up, not built here yet.
 
 ts_prod.planned_assignments does not exist until the first assignment is
-saved - save_assignment() runs a CREATE TABLE IF NOT EXISTS before every
+saved - save_assignment() calls dbconn.create_table() before every
 upsert, so a brand new install shows an all-empty grid rather than an
-error. (dbconn.write()/write_records looked like it should auto-create
-the table on first write, but in practice it never materialized one -
-switched to the same synthetic-id + dbconn.upsert() shape ts_my_week
-already uses for timetable_submissions, which is proven to work.)
+error. See the SCHEDULE_FIELDS comment below for why: Peliqan's warehouse
+runs on Baserow, and only create_table() registers a new table with
+Baserow's own catalog - neither dbconn.write()/write_records nor a raw
+CREATE TABLE via dbconn.execute() left anything queryable.
 
 No login, no scope check - same as every Data App in this repo except
 12011_ts_my_week and 11383_ts_mcp_server (see CLAUDE.md). Anyone who can
@@ -180,19 +180,24 @@ def load_schedule(start_date, end_date):
 # =====================================================
 
 # Same shape as ts_my_week's timetable_submissions: a synthetic string id
-# built from the natural key, upserted with dbconn.upsert - proven to work
-# in this codebase, unlike dbconn.write()/write_records, which turned out
-# NOT to auto-create the table (planned_assignments never appeared).
-CREATE_SCHEDULE_SQL = f"""
-CREATE TABLE IF NOT EXISTS {S}.{SCHEDULE_TABLE} (
-    id TEXT PRIMARY KEY,
-    user_id INTEGER NOT NULL,
-    date DATE NOT NULL,
-    project_id INTEGER NOT NULL,
-    note TEXT,
-    updated_at TEXT
-)
-"""
+# built from the natural key, upserted with dbconn.upsert.
+#
+# Peliqan's warehouse runs on Baserow under the hood (a real error message
+# leaked its own stack trace: /baserow/backend/src/baserow/...), and a raw
+# `CREATE TABLE ... ` through dbconn.execute() only reaches the underlying
+# Postgres - Baserow's own catalog (which insert/update/upsert/fetch all
+# resolve table names through) never learns the table exists, so it still
+# 404s as ERROR_TABLE_DOES_NOT_EXIST. dbconn.write()/write_records didn't
+# create anything queryable either. create_table() is Baserow's own table
+# API and is what actually registers a table both places at once.
+SCHEDULE_FIELDS = [
+    {"name": "id", "type": "text"},
+    {"name": "user_id", "type": "text"},
+    {"name": "date", "type": "text"},
+    {"name": "project_id", "type": "text"},
+    {"name": "note", "type": "text"},
+    {"name": "updated_at", "type": "text"},
+]
 
 
 def assignment_id(user_id, day):
@@ -200,10 +205,17 @@ def assignment_id(user_id, day):
 
 
 def ensure_schedule_table():
-    """Idempotent thanks to IF NOT EXISTS - cheap enough to call on every
-    save rather than tracking whether it already ran this session."""
+    """Create ts_prod.planned_assignments once. Idempotent: a second
+    create_table call against a table that already exists is expected to
+    fail, and that specific failure is swallowed; anything else re-raises
+    so it still reaches the Save button's error message."""
     dbconn = pq.dbconnect(DW_NAME)
-    dbconn.execute(DW_NAME, query=CREATE_SCHEDULE_SQL)
+    try:
+        dbconn.create_table(DW_NAME, S, SCHEDULE_TABLE, fields=SCHEDULE_FIELDS, pk=["id"])
+    except Exception as exc:
+        msg = str(exc).lower()
+        if "already exist" not in msg and "duplicate" not in msg:
+            raise
 
 
 def save_assignment(user_id, day, project_id, note):
