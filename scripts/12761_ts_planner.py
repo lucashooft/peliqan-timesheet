@@ -190,14 +190,17 @@ def load_schedule(start_date, end_date):
 # 404s as ERROR_TABLE_DOES_NOT_EXIST. dbconn.write()/write_records didn't
 # create anything queryable either. create_table() is Baserow's own table
 # API and is what actually registers a table both places at once.
-SCHEDULE_FIELDS = [
-    {"name": "id", "type": "text"},
-    {"name": "user_id", "type": "text"},
-    {"name": "date", "type": "text"},
-    {"name": "project_id", "type": "text"},
-    {"name": "note", "type": "text"},
-    {"name": "updated_at", "type": "text"},
-]
+# fields is {field_name: field_type}, not a list - a first attempt with
+# a list of {"name", "type"} dicts came back "'list' object has no
+# attribute 'items'", i.e. the backend calls fields.items() directly.
+SCHEDULE_FIELDS = {
+    "id": "text",
+    "user_id": "text",
+    "date": "text",
+    "project_id": "text",
+    "note": "text",
+    "updated_at": "text",
+}
 
 
 def assignment_id(user_id, day):
@@ -211,7 +214,7 @@ def ensure_schedule_table():
     so it still reaches the Save button's error message."""
     dbconn = pq.dbconnect(DW_NAME)
     try:
-        dbconn.create_table(DW_NAME, S, SCHEDULE_TABLE, fields=SCHEDULE_FIELDS, pk=["id"])
+        dbconn.create_table(DW_NAME, S, SCHEDULE_TABLE, fields=SCHEDULE_FIELDS, pk="id")
     except Exception as exc:
         msg = str(exc).lower()
         if "already exist" not in msg and "duplicate" not in msg:

@@ -41,10 +41,13 @@ find in one app holds anywhere else — check.
   raw `CREATE TABLE` via `dbconn.execute()` reaches the underlying Postgres
   but Baserow never learns about it, so `insert`/`update`/`upsert`/`fetch`
   against that table still 404 as `ERROR_TABLE_DOES_NOT_EXIST`. Only
-  `dbconn.create_table(db_name, schema_name, table_name, fields=[{"name":...,
-  "type":...}], pk=[...])` registers a new table both places. `dbconn.write()`
-  /`write_records` doesn't either — despite looking like an auto-create path,
-  it left nothing queryable. Don't reach for either shortcut again.
+  `dbconn.create_table(db_name, schema_name, table_name, fields={field_name:
+  field_type, ...}, pk=field_name)` registers a new table both places — note
+  `fields` is a **dict**, not a list of `{"name","type"}` dicts (that shape
+  400s with `'list' object has no attribute 'items'`, i.e. the backend calls
+  `fields.items()` directly). `dbconn.write()`/`write_records` doesn't create
+  a table either — despite looking like an auto-create path, it left nothing
+  queryable. Don't reach for either shortcut again.
 - **`ts_prod.planned_assignments` is a standalone schedule, not derived from
   `timetable`.** `12761_ts_planner` calls `dbconn.create_table()` (see above)
   before every `dbconn.upsert`, keyed on a synthetic `id` = `f"{user_id}_
