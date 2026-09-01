@@ -222,12 +222,22 @@ def ensure_schedule_table():
 
 
 def save_assignment(user_id, day, project_id, note):
-    """Plan `user_id` onto `project_id` for `day`, or move an existing
+    """
+    Plan `user_id` onto `project_id` for `day`, or move an existing
     plan to a different project - the same call either way, upserted on
-    the (user_id, date) pair's synthetic id."""
+    the (user_id, date) pair's synthetic id.
+
+    `pk` only tells upsert() which row to match for the UPDATE half; on
+    the INSERT half (no existing row yet) nothing sets the "id" column
+    unless it's also in the fields dict - ts_my_week's submit_week()
+    includes "id" for exactly this reason, and leaving it out here is
+    what caused the earlier NULL-id insert.
+    """
     ensure_schedule_table()
     dbconn = pq.dbconnect(DW_NAME)
-    dbconn.upsert(DW_NAME, S, SCHEDULE_TABLE, assignment_id(user_id, day), {
+    aid = assignment_id(user_id, day)
+    dbconn.upsert(DW_NAME, S, SCHEDULE_TABLE, aid, {
+        "id": aid,
         "user_id": int(user_id),
         "date": day.isoformat(),
         "project_id": int(project_id),
