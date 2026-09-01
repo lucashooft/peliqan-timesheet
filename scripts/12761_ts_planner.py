@@ -21,10 +21,10 @@ else:  # Running outside of Peliqan
 """
 ts_planner (v2) - team resourcing SCHEDULE, standalone from actuals.
 
-One row per employee, WINDOW_DAYS blocks per row - the last 4 workweeks
-(Mon-Fri) by default, navigable in 4-week jumps - each block colored by
-the project PLANNED for that employee that day. Click any block to
-assign, change or clear its project.
+One row per employee, WINDOW_DAYS blocks per row - the current workweek
+plus the next 3 (Mon-Fri) by default, navigable in 4-week jumps - each
+block colored by the project PLANNED for that employee that day. Click
+any block to assign, change or clear its project.
 
 Deliberately NOT derived from ts_prod.timetable (logged hours): this is
 its own plan, stored in ts_prod.planned_assignments, so it can later be
@@ -272,7 +272,7 @@ def build_occupancy(user_ids, days, schedule):
 # State
 # =====================================================
 
-DEFAULT_START = monday_of(date.today()) - timedelta(weeks=WEEKS_IN_WINDOW - 1)
+DEFAULT_START = monday_of(date.today())
 
 if "planner_start" not in st.session_state:
     st.session_state.planner_start = DEFAULT_START
