@@ -28,8 +28,8 @@ cumulative. Only **two** surfaces know about it:
 - `12011_ts_my_week` — Google login required, scope-aware grid.
 - `11383_ts_mcp_server` — Bearer token, `min_scope` per tool.
 
-Every other app (`11282`, `11286`, `11290`, `11954`, `12507`) has no login and
-no scope check at all. `11286_ts_users_UI` writes `ts_prod.users`, and a row
+Every other app (`11282`, `11286`, `11290`, `11954`, `12507`, `12761`) has no
+login and no scope check at all. `11286_ts_users_UI` writes `ts_prod.users`, and a row
 there is what grants access to the two gated apps. Don't assume a rule you
 find in one app holds anywhere else — check.
 
