@@ -31,13 +31,15 @@ its own plan, stored in ts_prod.planned_assignments, so it can later be
 compared against what was actually logged instead of just echoing it.
 That comparison is a follow-up, not built here yet.
 
-ts_prod.planned_assignments does not exist until the first assignment is
-saved - save_assignment() calls dbconn.create_table() before every
-upsert, so a brand new install shows an all-empty grid rather than an
-error. See the SCHEDULE_FIELDS comment below for why: Peliqan's warehouse
-runs on Baserow, and only create_table() registers a new table with
-Baserow's own catalog - neither dbconn.write()/write_records nor a raw
-CREATE TABLE via dbconn.execute() left anything queryable.
+ONE-TIME SETUP: ts_prod.planned_assignments must be created by hand in
+the Peliqan UI before this app's Save button will work - same as every
+other table this repo reads (users, tasks, projects, clients, timetable,
+timetable_submissions), none of which were ever created from a script.
+help.peliqan.io's own tutorials assume this too (its API-key-auth guide
+says to "create a table named api_keys first" with no Python equivalent
+given). Columns, all text: id (this table's primary field), user_id,
+date, project_id, note, updated_at. Once it exists, save_assignment()'s
+dbconn.upsert() call needs nothing further.
 
 No login, no scope check - same as every Data App in this repo except
 12011_ts_my_week and 11383_ts_mcp_server (see CLAUDE.md). Anyone who can
@@ -180,45 +182,20 @@ def load_schedule(start_date, end_date):
 # =====================================================
 
 # Same shape as ts_my_week's timetable_submissions: a synthetic string id
-# built from the natural key, upserted with dbconn.upsert.
-#
-# Peliqan's warehouse runs on Baserow under the hood (a real error message
-# leaked its own stack trace: /baserow/backend/src/baserow/...), and a raw
-# `CREATE TABLE ... ` through dbconn.execute() only reaches the underlying
-# Postgres - Baserow's own catalog (which insert/update/upsert/fetch all
-# resolve table names through) never learns the table exists, so it still
-# 404s as ERROR_TABLE_DOES_NOT_EXIST. dbconn.write()/write_records didn't
-# create anything queryable either. create_table() is Baserow's own table
-# API and is what actually registers a table both places at once.
-# fields is {field_name: field_type}, not a list - a first attempt with
-# a list of {"name", "type"} dicts came back "'list' object has no
-# attribute 'items'", i.e. the backend calls fields.items() directly.
-SCHEDULE_FIELDS = {
-    "id": "text",
-    "user_id": "text",
-    "date": "text",
-    "project_id": "text",
-    "note": "text",
-    "updated_at": "text",
-}
+# built from the natural key, upserted with dbconn.upsert - this table
+# must already exist for that to work (see the module docstring for the
+# one-time setup: create it in the Peliqan UI, the same way every other
+# ts_prod table here already exists - none of them were ever created
+# from a script). dbconn.create_table()/write() both looked like SDK
+# paths that should do this from Python, and both turned out not to:
+# create_table() isn't documented anywhere on help.peliqan.io and its
+# behavior had to be reverse-engineered call by call; write()/
+# write_records never produced a queryable table at all. Don't reach for
+# either again - create the table by hand instead.
 
 
 def assignment_id(user_id, day):
     return f"{int(user_id)}_{day.isoformat()}"
-
-
-def ensure_schedule_table():
-    """Create ts_prod.planned_assignments once. Idempotent: a second
-    create_table call against a table that already exists is expected to
-    fail, and that specific failure is swallowed; anything else re-raises
-    so it still reaches the Save button's error message."""
-    dbconn = pq.dbconnect(DW_NAME)
-    try:
-        dbconn.create_table(DW_NAME, S, SCHEDULE_TABLE, fields=SCHEDULE_FIELDS, pk="id")
-    except Exception as exc:
-        msg = str(exc).lower()
-        if "already exist" not in msg and "duplicate" not in msg:
-            raise
 
 
 def save_assignment(user_id, day, project_id, note):
@@ -231,9 +208,8 @@ def save_assignment(user_id, day, project_id, note):
     the INSERT half (no existing row yet) nothing sets the "id" column
     unless it's also in the fields dict - ts_my_week's submit_week()
     includes "id" for exactly this reason, and leaving it out here is
-    what caused the earlier NULL-id insert.
+    what caused an earlier NULL-id insert.
     """
-    ensure_schedule_table()
     dbconn = pq.dbconnect(DW_NAME)
     aid = assignment_id(user_id, day)
     dbconn.upsert(DW_NAME, S, SCHEDULE_TABLE, aid, {

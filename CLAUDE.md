@@ -35,25 +35,27 @@ find in one app holds anywhere else — check.
 
 ## Data model traps
 
-- **The warehouse runs on Baserow under the hood** (confirmed by a leaked error
-  stack trace: `/baserow/backend/src/baserow/...`). Table names get resolved
-  through Baserow's own catalog, not just checked for physical existence — a
-  raw `CREATE TABLE` via `dbconn.execute()` reaches the underlying Postgres
-  but Baserow never learns about it, so `insert`/`update`/`upsert`/`fetch`
-  against that table still 404 as `ERROR_TABLE_DOES_NOT_EXIST`. Only
-  `dbconn.create_table(db_name, schema_name, table_name, fields={field_name:
-  field_type, ...}, pk=field_name)` registers a new table both places — note
-  `fields` is a **dict**, not a list of `{"name","type"}` dicts (that shape
-  400s with `'list' object has no attribute 'items'`, i.e. the backend calls
-  `fields.items()` directly). `dbconn.write()`/`write_records` doesn't create
-  a table either — despite looking like an auto-create path, it left nothing
-  queryable. Don't reach for either shortcut again.
+- **New tables get created by hand in the Peliqan UI, never from a script.**
+  Every table `dbconn` touches in this repo (`users`, `tasks`, `projects`,
+  `clients`, `timetable`, `timetable_submissions`, `planned_assignments`)
+  already existed before any script referenced it — none of the SDK's
+  table-creation-shaped methods actually deliver a queryable table from
+  Python. `dbconn.write()`/`write_records` looks like an auto-create path and
+  isn't. `dbconn.create_table()` isn't documented anywhere on
+  help.peliqan.io, and even after reverse-engineering its call shape (`fields`
+  must be a `{field_name: field_type}` dict — a list of `{"name","type"}`
+  dicts 400s with `'list' object has no attribute 'items'`) it's still an
+  undocumented, unverified path. help.peliqan.io's own tutorials assume
+  manual creation too (the API-key-auth guide: "create a table named
+  api_keys first," no Python equivalent given). If a script needs a new
+  table, say so and create it in the UI first — don't reach for
+  `create_table()` or `write()` again.
 - **`ts_prod.planned_assignments` is a standalone schedule, not derived from
-  `timetable`.** `12761_ts_planner` calls `dbconn.create_table()` (see above)
-  before every `dbconn.upsert`, keyed on a synthetic `id` = `f"{user_id}_
-  {date}"` — the same shape `ts_my_week` uses for `timetable_submissions`. It
-  is deliberately NOT compared against logged hours yet; that comparison is a
-  known follow-up, not built.
+  `timetable`.** Created by hand (see above), columns `id, user_id, date,
+  project_id, note, updated_at`, all text. `12761_ts_planner` upserts it
+  keyed on a synthetic `id` = `f"{user_id}_{date}"` — the same shape
+  `ts_my_week` uses for `timetable_submissions`. Deliberately NOT compared
+  against logged hours yet; that comparison is a known follow-up, not built.
 - **`dbconn.update`/`insert` run string values through `Decimal()`.** Passing
   `"true"` for a boolean column returns a 400 with
   `[<class 'decimal.ConversionSyntax'>]`. Always pass real Python bools.
