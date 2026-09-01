@@ -36,11 +36,13 @@ find in one app holds anywhere else — check.
 ## Data model traps
 
 - **`ts_prod.planned_assignments` is a standalone schedule, not derived from
-  `timetable`.** `12761_ts_planner` writes it via `dbconn.write(..., pk=
-  ["user_id", "date"])`, which both auto-creates the table on the first save
-  and upserts on every one after — one project per employee per day, no
-  separate `create_table` step. It is deliberately NOT compared against
-  logged hours yet; that comparison is a known follow-up, not built.
+  `timetable`.** `12761_ts_planner` runs a `CREATE TABLE IF NOT EXISTS` before
+  every `dbconn.upsert`, keyed on a synthetic `id` = `f"{user_id}_{date}"` —
+  the same shape `ts_my_week` uses for `timetable_submissions`. (`dbconn.write()`
+  /`write_records` looked like it should auto-create the table on first write;
+  it didn't, so don't reach for that again without verifying it actually lands
+  a table.) It is deliberately NOT compared against logged hours yet; that
+  comparison is a known follow-up, not built.
 - **`dbconn.update`/`insert` run string values through `Decimal()`.** Passing
   `"true"` for a boolean column returns a 400 with
   `[<class 'decimal.ConversionSyntax'>]`. Always pass real Python bools.

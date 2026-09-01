@@ -32,8 +32,12 @@ compared against what was actually logged instead of just echoing it.
 That comparison is a follow-up, not built here yet.
 
 ts_prod.planned_assignments does not exist until the first assignment is
-saved - dbconn.write() auto-creates it (see save_assignment below), so a
-brand new install shows an all-empty grid rather than an error.
+saved - save_assignment() runs a CREATE TABLE IF NOT EXISTS before every
+upsert, so a brand new install shows an all-empty grid rather than an
+error. (dbconn.write()/write_records looked like it should auto-create
+the table on first write, but in practice it never materialized one -
+switched to the same synthetic-id + dbconn.upsert() shape ts_my_week
+already uses for timetable_submissions, which is proven to work.)
 
 No login, no scope check - same as every Data App in this repo except
 12011_ts_my_week and 11383_ts_mcp_server (see CLAUDE.md). Anyone who can
@@ -175,36 +179,53 @@ def load_schedule(start_date, end_date):
 # Writes
 # =====================================================
 
-def save_assignment(user_id, day, project_id, note):
-    """
-    Plan `user_id` onto `project_id` for `day`, or move an existing plan
-    to a different project - the same call either way.
+# Same shape as ts_my_week's timetable_submissions: a synthetic string id
+# built from the natural key, upserted with dbconn.upsert - proven to work
+# in this codebase, unlike dbconn.write()/write_records, which turned out
+# NOT to auto-create the table (planned_assignments never appeared).
+CREATE_SCHEDULE_SQL = f"""
+CREATE TABLE IF NOT EXISTS {S}.{SCHEDULE_TABLE} (
+    id TEXT PRIMARY KEY,
+    user_id INTEGER NOT NULL,
+    date DATE NOT NULL,
+    project_id INTEGER NOT NULL,
+    note TEXT,
+    updated_at TEXT
+)
+"""
 
-    dbconn.write() creates ts_prod.planned_assignments on the very first
-    call (inferring columns from these fields) and upserts on every call
-    after, keyed on pk=["user_id", "date"] - exactly the one-project-
-    per-employee-per-day rule this grid assumes, so no separate
-    create_table step is needed.
-    """
+
+def assignment_id(user_id, day):
+    return f"{int(user_id)}_{day.isoformat()}"
+
+
+def ensure_schedule_table():
+    """Idempotent thanks to IF NOT EXISTS - cheap enough to call on every
+    save rather than tracking whether it already ran this session."""
     dbconn = pq.dbconnect(DW_NAME)
-    dbconn.write(S, SCHEDULE_TABLE, [{
+    dbconn.execute(DW_NAME, query=CREATE_SCHEDULE_SQL)
+
+
+def save_assignment(user_id, day, project_id, note):
+    """Plan `user_id` onto `project_id` for `day`, or move an existing
+    plan to a different project - the same call either way, upserted on
+    the (user_id, date) pair's synthetic id."""
+    ensure_schedule_table()
+    dbconn = pq.dbconnect(DW_NAME)
+    dbconn.upsert(DW_NAME, S, SCHEDULE_TABLE, assignment_id(user_id, day), {
         "user_id": int(user_id),
         "date": day.isoformat(),
         "project_id": int(project_id),
         "note": (note or "").strip(),
         "updated_at": datetime.utcnow().isoformat(),
-    }], pk=["user_id", "date"], db_name=DW_NAME)
+    })
     load_schedule.clear()
 
 
 def clear_assignment(user_id, day):
     dbconn = pq.dbconnect(DW_NAME)
-    try:
-        dbconn.execute(DW_NAME, query=(
-            f"DELETE FROM {S}.{SCHEDULE_TABLE} "
-            f"WHERE user_id = {int(user_id)} AND date = '{day.isoformat()}'"))
-    except Exception:
-        pass
+    dbconn.execute(DW_NAME, query=(
+        f"DELETE FROM {S}.{SCHEDULE_TABLE} WHERE id = '{assignment_id(user_id, day)}'"))
     load_schedule.clear()
 
 # =====================================================
@@ -282,11 +303,19 @@ def assign_dialog(user_id, day, employee_name, projects, current_project_id, cur
     c1, c2 = st.columns(2)
     if c1.button("Save", type="primary", width='stretch',
                  disabled=project_id is None, key="plan_save"):
-        save_assignment(user_id, day, project_id, note)
-        st.rerun()
+        try:
+            save_assignment(user_id, day, project_id, note)
+        except Exception as exc:
+            st.error(f"Could not save: {exc}")
+        else:
+            st.rerun()
     if current_project_id is not None and c2.button("Clear", width='stretch', key="plan_clear"):
-        clear_assignment(user_id, day)
-        st.rerun()
+        try:
+            clear_assignment(user_id, day)
+        except Exception as exc:
+            st.error(f"Could not clear: {exc}")
+        else:
+            st.rerun()
 
 # =====================================================
 # Page
