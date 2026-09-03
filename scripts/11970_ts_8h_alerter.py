@@ -36,7 +36,10 @@ Two notifications per run:
 Monitored users / team leads are both derived dynamically from ts_prod.users:
 anyone with a non-null name, email AND scope (this excludes placeholder
 "role" rows like "Admin (Scope 3)" which have no email). NOTIFY_ONLY narrows
-that to a named few; EXCLUDE drops individuals and is applied last.
+that to a named few; EXCLUDE drops individuals and is applied last - it
+affects monitoring and the per-employee DM. WEEKLY_EXCLUDE is separate: it
+only hides matching employees' shortfall days from the Monday team-lead
+digest content, they're still monitored and still get their own daily DM.
 
 Slack DMs are sent as {"channel": "@<handle>"}, where the handle is the
 local part of the person's ts_prod.users.email - lucas@peliqan.io becomes
@@ -77,6 +80,11 @@ NOTIFY_ONLY = None
 # matched case-insensitively: "Niko" and "niko@peliqan.io" exclude the same
 # person. Use the email where two people could share a first name.
 EXCLUDE = ["arthur@peliqan.io"]
+
+# Same name/email matching as EXCLUDE, but only hides matching employees'
+# shortfall days from the Monday team-lead digest content - they're still
+# monitored and still get their own daily DM.
+WEEKLY_EXCLUDE = []
 
 
 # name -> email, filled from the roster query. Read by slack_handle_for.
@@ -129,6 +137,13 @@ def format_shortfall_line(day, minutes):
     else:
         detail = f"{deficit} minutes short"
     return f"\u2022 {day.strftime('%a')} {day.isoformat()}: {detail}"
+
+
+def matches_exclude(user_name, excluded):
+    """Match on either the name or the email, so a list of addresses and a
+    list of names both behave the way someone would expect."""
+    return (user_name.strip().lower() in excluded
+            or str(EMAIL_BY_NAME.get(user_name) or "").strip().lower() in excluded)
 
 
 def daterange(start, end_exclusive):
@@ -188,16 +203,9 @@ else:
     if EXCLUDE:
         excluded = {str(x).strip().lower() for x in EXCLUDE if str(x).strip()}
 
-        def is_excluded(user_name):
-            """Match on either the name or the email, so a list of addresses
-            and a list of names both behave the way someone would expect."""
-            return (user_name.strip().lower() in excluded
-                    or str(EMAIL_BY_NAME.get(user_name) or "").strip().lower()
-                    in excluded)
-
-        skipped = [u for u in USER_LIST if is_excluded(u)]
-        USER_LIST = [u for u in USER_LIST if not is_excluded(u)]
-        TEAM_LEADS = [u for u in TEAM_LEADS if not is_excluded(u)]
+        skipped = [u for u in USER_LIST if matches_exclude(u, excluded)]
+        USER_LIST = [u for u in USER_LIST if not matches_exclude(u, excluded)]
+        TEAM_LEADS = [u for u in TEAM_LEADS if not matches_exclude(u, excluded)]
         print(f"Excluded {len(skipped)} user(s): {skipped}")
         # An entry matching nobody is nearly always a typo or a departed
         # colleague, and silently doing nothing is how it stays wrong.
@@ -307,23 +315,32 @@ else:
         # -------------------------------------------------------------
 
         if today.weekday() == 0:  # Monday
+            weekly_excluded = {str(x).strip().lower() for x in WEEKLY_EXCLUDE if str(x).strip()}
+            by_user_weekly = {
+                user: days for user, days in by_user.items()
+                if not matches_exclude(user, weekly_excluded)
+            }
+            if weekly_excluded:
+                print(f"Weekly digest additionally excludes: {sorted(set(by_user) - set(by_user_weekly))}")
+
             if not TEAM_LEADS:
                 print("Today is Monday but no team leads found (scope="
                       f"{TEAM_LEAD_SCOPE}) - no digest sent.")
-            elif not by_user:
+            elif not by_user_weekly:
                 print("Today is Monday but there are no outstanding shortfalls - no digest sent.")
             else:
+                weekly_shortfall_count = sum(len(days) for days in by_user_weekly.values())
                 lines = [
                     f"Weekly missing-hours overview - as of {today.isoformat()} (Mon)",
                     f"Tracking since {window_start_str}.",
                     "",
-                    f"{len(shortfalls)} day(s) still outstanding across {len(by_user)} "
-                    "employee(s):",
+                    f"{weekly_shortfall_count} day(s) still outstanding across "
+                    f"{len(by_user_weekly)} employee(s):",
                     "",
                 ]
-                for user in sorted(by_user):
+                for user in sorted(by_user_weekly):
                     lines.append(f"*{user}*")
-                    for day, minutes in sorted(by_user[user]):
+                    for day, minutes in sorted(by_user_weekly[user]):
                         lines.append(format_shortfall_line(day, minutes))
                     lines.append("")
                 digest_text = "\n".join(lines).rstrip()
