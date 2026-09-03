@@ -23,14 +23,19 @@ Two consequences:
 ## Which apps enforce anything
 
 Roles come from `ts_prod.users.scope`: 1 employee, 2 manager, 3 admin,
-cumulative. Only **two** surfaces know about it:
+cumulative. Only **three** surfaces know about it:
 
 - `12011_ts_my_week` — Google login required, scope-aware grid.
 - `11383_ts_mcp_server` — Bearer token, `min_scope` per tool.
+- `11954_ts_bi_dashboard` — Google login required, scope >= 2 only (no
+  per-viewer filtering once in, unlike `12011`). Same Google Cloud OAuth
+  client (client_id/client_secret) as `12011`, own redirect_uri and cookie
+  prefix; the flow itself is duplicated code, not shared — see the OAuth
+  block comment in `11954` and "Apps cannot import each other" below.
 
-Every other app (`11282`, `11286`, `11290`, `11954`, `12507`, `12761`) has no
-login and no scope check at all. `11286_ts_users_UI` writes `ts_prod.users`, and a row
-there is what grants access to the two gated apps. Don't assume a rule you
+Every other app (`11282`, `11286`, `11290`, `12507`, `12761`) has no login
+and no scope check at all. `11286_ts_users_UI` writes `ts_prod.users`, and a
+row there is what grants access to the gated apps. Don't assume a rule you
 find in one app holds anywhere else — check.
 
 ## Data model traps

@@ -39,15 +39,26 @@ Two tabs, two different data sources:
                          editable inline; everything else (task, employee,
                          date, billable) is read-only.
 
-NOTE: this app has no login and no scope check (see CLAUDE.md - only
-ts_my_week and ts_mcp_server enforce anything). That means the Project
-explorer's editing is wide open to anyone with the dashboard URL. Accepted
-as a known tradeoff for now.
+Access: Google login required, same flow and same Google Cloud OAuth
+client (client_id/client_secret) as ts_my_week (12011), but gated on
+ts_prod.users.scope >= 2 (manager/admin) instead of any user row - this
+dashboard has no per-viewer filtering, so an employee-scope login would
+see and edit everyone's data. See the OAuth block below for why the flow
+is duplicated rather than shared.
 """
+
+import base64
+import hashlib
+import hmac
+import json
+import secrets
+import urllib.error
+import urllib.parse
+import urllib.request
 
 import streamlit as st
 import pandas as pd
-from datetime import date
+from datetime import date, datetime, timezone
 
 st.set_page_config(page_title="Project BI Dashboard", layout="wide")
 
@@ -156,6 +167,357 @@ def update_entry(entry_id, values):
     dbconn = pq.dbconnect(DW_NAME)
     dbconn.update(DW_NAME, S, "timetable", int(entry_id), values)
 
+
+# =====================================================
+# Google login (OAuth 2.0 authorization code flow)
+# =====================================================
+#
+# Same flow as ts_my_week (12011_ts_my_week.py) - duplicated here because
+# Peliqan apps cannot import each other; keep the two in step if the flow
+# ever changes. Uses the SAME Google Cloud OAuth client as ts_my_week
+# (same client_id / client_secret Secret Store entries), but this app's
+# own redirect_uri, which must be registered as an extra "Authorized
+# redirect URI" on that same Google Cloud client. A distinct cookie
+# prefix keeps this app's session cookie from colliding with ts_my_week's.
+#
+# Difference from ts_my_week: access requires scope >= 2, not just any
+# row in ts_prod.users.
+
+MANAGE_SCOPE = 2
+
+GOOGLE_AUTH_URL = "https://accounts.google.com/o/oauth2/v2/auth"
+GOOGLE_TOKEN_URL = "https://oauth2.googleapis.com/token"
+GOOGLE_ISSUERS = ("accounts.google.com", "https://accounts.google.com")
+
+# Must match an "Authorized redirect URI" on the Google Cloud OAuth client
+# byte for byte, trailing slash included - the same client ts_my_week uses.
+PUBLISHED_APP_URL = (
+    "https://app.eu.peliqan.io/apps/"
+    "RVRoRjhXR2FVVUpRMmZDZExrTk1qeXJDd1FmbUR1Q01QNk5QTDd2dzFtc0VYQWNwelM4THVtZzJuSnQyR25lWA==/"
+)
+# For local `streamlit run` development, point this at http://localhost:8501/
+# and register that as another redirect URI on the same Google client.
+REDIRECT_URI = PUBLISHED_APP_URL
+
+SECRET_CLIENT_ID = "google_login_client_id"
+SECRET_CLIENT_SECRET = "google_login_client_secret"
+SECRET_COOKIE_PASSWORD = "ts_cookie_password"
+
+SESSION_HOURS = 12            # how long one login stays valid
+STATE_MAX_AGE = 30 * 60       # a started login must be completed within this
+COOKIE_PREFIX = "ts_bi_dashboard_"
+COOKIE_SESSION = "session"
+
+
+def to_int(v):
+    try:
+        return int(float(v))
+    except (TypeError, ValueError):
+        return None
+
+
+@st.cache_data(ttl=300)
+def load_users():
+    dbconn = pq.dbconnect(DW_NAME)
+    rows = dbconn.fetch(DW_NAME, S, "users") or []
+    return [r for r in rows if to_int(r.get("id")) is not None]
+
+
+class LoginError(Exception):
+    """Anything that must send the visitor back to the login page."""
+
+
+class StaleCodeError(LoginError):
+    """The authorization code was already redeemed, or it expired."""
+
+
+def now_ts():
+    return int(datetime.now(timezone.utc).timestamp())
+
+
+@st.cache_data(ttl=3600)
+def oauth_config():
+    return {
+        "client_id": pq.get_secret(SECRET_CLIENT_ID),
+        "client_secret": pq.get_secret(SECRET_CLIENT_SECRET),
+        "cookie_password": pq.get_secret(SECRET_COOKIE_PASSWORD),
+    }
+
+
+def b64url_encode(raw):
+    return base64.urlsafe_b64encode(raw).decode().rstrip("=")
+
+
+def b64url_decode(txt):
+    return base64.urlsafe_b64decode(str(txt) + "=" * (-len(str(txt)) % 4))
+
+
+def sign(payload):
+    key = oauth_config()["cookie_password"].encode()
+    return b64url_encode(hmac.new(key, payload.encode(), hashlib.sha256).digest())
+
+
+def make_state():
+    rand = secrets.token_urlsafe(16)
+    body = b64url_encode(json.dumps({"r": rand, "t": now_ts()}).encode())
+    return body + "." + sign(body), rand
+
+
+def read_state(state):
+    try:
+        body, mac = str(state).split(".", 1)
+    except (ValueError, AttributeError):
+        raise LoginError("The login response carried no state - please sign in again.")
+    if not hmac.compare_digest(mac, sign(body)):
+        raise LoginError("The login response did not belong to a login started here.")
+    try:
+        data = json.loads(b64url_decode(body))
+    except Exception:
+        raise LoginError("The login state was unreadable - please sign in again.")
+    if now_ts() - int(data.get("t") or 0) > STATE_MAX_AGE:
+        raise LoginError("This login took too long to complete - please sign in again.")
+    return str(data.get("r") or "")
+
+
+def nonce_for(state_rand):
+    return sign("nonce|" + state_rand)
+
+
+def build_auth_url(state, state_rand):
+    return GOOGLE_AUTH_URL + "?" + urllib.parse.urlencode({
+        "client_id": oauth_config()["client_id"],
+        "redirect_uri": REDIRECT_URI,
+        "response_type": "code",
+        "scope": "openid email profile",
+        "state": state,
+        "nonce": nonce_for(state_rand),
+        "access_type": "online",
+        "prompt": "select_account",
+    })
+
+
+def exchange_code(code):
+    cfg = oauth_config()
+    body = urllib.parse.urlencode({
+        "code": code,
+        "client_id": cfg["client_id"],
+        "client_secret": cfg["client_secret"],
+        "redirect_uri": REDIRECT_URI,
+        "grant_type": "authorization_code",
+    }).encode()
+    req = urllib.request.Request(
+        GOOGLE_TOKEN_URL, data=body,
+        headers={"Content-Type": "application/x-www-form-urlencoded"},
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            return json.loads(resp.read().decode("utf-8"))
+    except urllib.error.HTTPError as exc:
+        detail = ""
+        try:
+            detail = json.loads(exc.read().decode("utf-8")).get("error", "")
+        except Exception:
+            pass
+        if detail == "invalid_grant":
+            raise StaleCodeError("This authorization code was already used or has expired.")
+        raise LoginError(
+            f"Google refused this login ({detail or exc.code}). Usually the "
+            "redirect URI or the client secret does not match the Google Cloud client."
+        )
+    except Exception:
+        raise LoginError("Could not reach Google to finish the login - please try again.")
+
+
+def read_identity(tokens, expected_nonce):
+    """Signature not re-checked: the token arrived straight from Google's
+    token endpoint over TLS, in response to a request carrying our client
+    secret - the one case Google documents as not requiring it."""
+    id_token = tokens.get("id_token")
+    if not id_token:
+        raise LoginError("Google returned no identity token.")
+    try:
+        claims = json.loads(b64url_decode(id_token.split(".")[1]))
+    except Exception:
+        raise LoginError("The identity token from Google was unreadable.")
+
+    if claims.get("iss") not in GOOGLE_ISSUERS:
+        raise LoginError("That identity token was not issued by Google.")
+    if claims.get("aud") != oauth_config()["client_id"]:
+        raise LoginError("That identity token was issued for a different application.")
+    if int(claims.get("exp") or 0) <= now_ts():
+        raise LoginError("That identity token had already expired.")
+    if expected_nonce and claims.get("nonce") != expected_nonce:
+        raise LoginError("That identity token does not match this login attempt.")
+    if not is_true(claims.get("email_verified")):
+        raise LoginError("This Google account has no verified email address.")
+
+    email = str(claims.get("email") or "").strip().lower()
+    if not email:
+        raise LoginError("Google returned no email address for this account.")
+    return {"email": email, "name": claims.get("name") or email}
+
+
+def init_cookies():
+    if st.session_state.get("cookies_unavailable"):
+        return None
+    try:
+        st.cache = st.cache_data     # streamlit_cookies_manager still expects st.cache
+        from streamlit_cookies_manager import EncryptedCookieManager
+        return EncryptedCookieManager(prefix=COOKIE_PREFIX,
+                                      password=oauth_config()["cookie_password"])
+    except Exception:
+        st.session_state.cookies_unavailable = True
+        return None
+
+
+def store_session(cookies, email, name):
+    auth = {"email": email, "name": name, "exp": now_ts() + SESSION_HOURS * 3600}
+    st.session_state.auth = auth
+    if cookies is not None:
+        body = b64url_encode(json.dumps(auth).encode())
+        try:
+            cookies[COOKIE_SESSION] = body + "." + sign(body)
+            cookies.save()
+        except Exception:
+            pass
+    return auth
+
+
+def read_session(cookies):
+    auth = st.session_state.get("auth")
+    if not auth and cookies is not None:
+        raw = cookies.get(COOKIE_SESSION)
+        if raw:
+            try:
+                body, mac = str(raw).split(".", 1)
+                if hmac.compare_digest(mac, sign(body)):
+                    auth = json.loads(b64url_decode(body))
+            except Exception:
+                auth = None
+    if not auth or int(auth.get("exp") or 0) <= now_ts():
+        return None
+    st.session_state.auth = auth
+    return auth
+
+
+def end_session(cookies):
+    st.session_state.pop("auth", None)
+    if cookies is not None:
+        try:
+            cookies[COOKIE_SESSION] = ""
+            cookies.save()
+        except Exception:
+            pass
+
+
+def login_page(message=None):
+    """Render the sign-in page and stop the script - never returns."""
+    stashed = st.session_state.pop("login_message", None)
+    message = message or stashed
+    state, state_rand = make_state()
+    st.title("Project BI Dashboard")
+    if message:
+        st.error(message)
+    st.write("Sign in with your Google timesheet account. This dashboard "
+             "is limited to managers and admins.")
+    st.markdown(
+        f"<a href='{build_auth_url(state, state_rand)}' target='_top' "
+        "style='display:inline-block;padding:0.55rem 1.1rem;border-radius:0.5rem;"
+        "background:#053763;color:#fff;text-decoration:none;font-weight:600;'>"
+        "Sign in with Google</a>",
+        unsafe_allow_html=True,
+    )
+    if st.session_state.get("cookies_unavailable"):
+        st.caption("Cookies are unavailable here, so a page refresh will ask you to sign in again.")
+    st.stop()
+
+
+GOOGLE_PARAMS = ("code", "state", "scope", "authuser", "prompt", "hd", "error", "error_subtype")
+
+
+def clear_login_params():
+    for key in GOOGLE_PARAMS:
+        if key in st.query_params:
+            del st.query_params[key]
+
+
+def match_login_to_user(email):
+    for u in load_users():
+        if str(u.get("email") or "").strip().lower() == email:
+            return u
+    return None
+
+# ---- the gate: nothing below here runs unauthenticated or under scope ----
+
+try:
+    oauth_config()
+except Exception:
+    st.error(
+        "Google login is not configured yet. Add these three entries to the "
+        f"Peliqan Secret Store: {SECRET_CLIENT_ID}, {SECRET_CLIENT_SECRET} "
+        f"and {SECRET_COOKIE_PASSWORD}."
+    )
+    st.stop()
+
+cookies = init_cookies()
+if cookies is not None and not cookies.ready():
+    st.stop()                    # cookie component still initialising
+
+auth = read_session(cookies)
+
+if auth is None:
+    params = st.query_params
+    if params.get("error"):
+        denied = f"Google did not complete the login ({str(params.get('error'))})."
+        st.session_state.login_message = denied
+        clear_login_params()
+        login_page(denied)
+    code = params.get("code")
+    if not code:
+        login_page()
+    consumed = st.session_state.setdefault("consumed_codes", set())
+    if str(code) in consumed:
+        clear_login_params()
+        login_page()
+    consumed.add(str(code))
+    try:
+        state_rand = read_state(params.get("state"))
+        identity = read_identity(exchange_code(code), nonce_for(state_rand))
+    except StaleCodeError:
+        clear_login_params()
+        login_page()
+    except LoginError as exc:
+        st.session_state.login_message = str(exc)
+        clear_login_params()
+        login_page(str(exc))
+    auth = store_session(cookies, identity["email"], identity["name"])
+    clear_login_params()
+    st.rerun()
+
+elif "code" in st.query_params:
+    clear_login_params()    # already signed in: drop a stale code from the URL
+
+login_user = match_login_to_user(auth["email"])
+if login_user is None:
+    st.title("Project BI Dashboard")
+    st.error(
+        f"{auth['email']} is not a timesheet user. Ask an administrator to add this "
+        "email address to the users table, or sign in with another account."
+    )
+    if st.button("Sign in with another account", key="switch_account"):
+        end_session(cookies)
+        st.rerun()
+    st.stop()
+
+if (to_int(login_user.get("scope")) or 1) < MANAGE_SCOPE:
+    st.title("Project BI Dashboard")
+    st.error("This dashboard is limited to managers and admins. Ask an "
+             "administrator for a scope upgrade if you believe you should "
+             "have access.")
+    if st.button("Sign in with another account", key="switch_account"):
+        end_session(cookies)
+        st.rerun()
+    st.stop()
 
 raw_df = load_entries()
 
