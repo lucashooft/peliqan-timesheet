@@ -91,7 +91,12 @@ EXCLUDE = ["arthur@peliqan.io"]
 # Same name/email matching as EXCLUDE, but only hides matching employees'
 # shortfall days from the Monday team-lead digest content - they're still
 # monitored and still get their own daily DM.
-WEEKLY_EXCLUDE = []
+WEEKLY_EXCLUDE = [
+    "adel.asique@peliqan.io",
+    "sinku@peliqan.io",
+    "kamal@peliqan.io",
+    "govind@peliqan.io",
+]
 
 
 # name -> email, filled from the roster query. Read by send_slack_dm.
