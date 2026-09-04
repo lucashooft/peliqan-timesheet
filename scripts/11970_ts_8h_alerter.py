@@ -41,12 +41,16 @@ affects monitoring and the per-employee DM. WEEKLY_EXCLUDE is separate: it
 only hides matching employees' shortfall days from the Monday team-lead
 digest content, they're still monitored and still get their own daily DM.
 
-Slack DMs are sent as {"channel": "@<handle>"}, where the handle is the
-local part of the person's ts_prod.users.email - lucas@peliqan.io becomes
-@lucas. That holds for everyone, so there is no override table. A DM to a
-handle Slack does not know fails the way a bad channel name does, which is
-silently from this script's point of view; the run prints every resolved
-handle at the start and each send result after, so check those.
+Slack DMs go through a Slack bot ("Bender"), not a Peliqan connector - the
+bot token (xoxb-...) is a static secret (SLACK_BOT_TOKEN_SECRET, read via
+pq.get_secret) that doesn't expire the way a connector session can. Each
+person's ts_prod.users.email is resolved to a Slack user ID via
+users.lookupByEmail (cached in SLACK_USER_ID_BY_EMAIL - one lookup per
+email per run even though an employee-who-is-also-a-team-lead is DM'd
+twice), then chat.postMessage sends to that user ID directly; Slack opens
+the IM the first time without any conversations.open call. A lookup or
+send failure is caught and printed per person rather than aborting the
+run, so check the printed result for every person.
 
 NOTE: ts_prod.users.name is the join key against fact_timetable.user_name and
 the key of every per-user dict here, so two people sharing a name would be
@@ -58,7 +62,9 @@ schedule configured for this data-app in Peliqan - that's unchanged by this
 script edit.
 """
 
+import json
 import time
+import urllib.request
 from datetime import date, timedelta
 
 # ---------------------------------------------------------------------------
@@ -87,12 +93,16 @@ EXCLUDE = ["arthur@peliqan.io"]
 WEEKLY_EXCLUDE = []
 
 
-# name -> email, filled from the roster query. Read by slack_handle_for.
+# name -> email, filled from the roster query. Read by send_slack_dm.
 EMAIL_BY_NAME = {}
+
+# email -> Slack user ID, filled lazily by slack_user_id_for.
+SLACK_USER_ID_BY_EMAIL = {}
 
 # Only shortfall days on/after this date are tracked/notified.
 FIXED_START_DATE = date(2026, 9, 1)
-SLACK_CONNECTION_NAME = "Slack"
+SLACK_BOT_TOKEN_SECRET = "slack_bot_token"
+SLACK_API_BASE = "https://slack.com/api"
 WORKDAY_MINUTES = 480
 DAILY_THRESHOLD_MINUTES = WORKDAY_MINUTES
 WORKDAYS_TO_CHECK = [0, 1, 2, 3, 4]
@@ -112,19 +122,42 @@ def fetch_with_retry(dbconn, query, label):
             time.sleep(RETRY_DELAY_SECONDS)
 
 
-def slack_handle_for(name):
-    """
-    The Slack username to DM this person.
+def slack_api_call(token, method, payload):
+    """POST a Slack Web API method as JSON, bearer-authenticated with the bot
+    token. Raises on a transport error or an {"ok": false} response - the
+    caller is responsible for catching that per person so one bad lookup or
+    send doesn't abort the whole run."""
+    req = urllib.request.Request(
+        f"{SLACK_API_BASE}/{method}",
+        data=json.dumps(payload).encode("utf-8"),
+        headers={
+            "Authorization": f"Bearer {token}",
+            "Content-Type": "application/json; charset=utf-8",
+        },
+        method="POST",
+    )
+    with urllib.request.urlopen(req, timeout=15) as resp:
+        body = json.loads(resp.read().decode("utf-8"))
+    if not body.get("ok"):
+        raise RuntimeError(f"Slack {method} failed: {body.get('error')}")
+    return body
 
-    The local part of their email - lucas@peliqan.io gives "lucas" - which
-    is how every handle here is set. Unlike the display name it survives
-    capitals, spaces and hyphens; "Piet-Michiel" was never going to resolve.
 
-    The roster query requires a non-null email, so anyone reaching this has
-    one. A blank result would send to "@", which the startup line prints as
-    an empty handle rather than hiding it.
-    """
-    return str(EMAIL_BY_NAME.get(name) or "").split("@")[0].strip()
+def slack_user_id_for(token, name):
+    """This person's Slack user ID, resolved from their ts_prod.users email
+    via users.lookupByEmail and cached in SLACK_USER_ID_BY_EMAIL."""
+    email = str(EMAIL_BY_NAME.get(name) or "").strip().lower()
+    if email not in SLACK_USER_ID_BY_EMAIL:
+        body = slack_api_call(token, "users.lookupByEmail", {"email": email})
+        SLACK_USER_ID_BY_EMAIL[email] = body["user"]["id"]
+    return SLACK_USER_ID_BY_EMAIL[email]
+
+
+def send_slack_dm(token, name, text):
+    """DM this person via chat.postMessage - Slack opens the IM automatically
+    when the channel is a user ID, no conversations.open call needed."""
+    user_id = slack_user_id_for(token, name)
+    return slack_api_call(token, "chat.postMessage", {"channel": user_id, "text": text})
 
 
 def format_shortfall_line(day, minutes):
@@ -215,8 +248,8 @@ else:
             print(f"WARNING: EXCLUDE entries matching no user: {sorted(unmatched)}")
 
     print(f"Monitoring {len(USER_LIST)} user(s): {USER_LIST}")
-    print("Slack handles: "
-          + ", ".join(f"{u} -> @{slack_handle_for(u)}" for u in USER_LIST))
+    print("Slack emails: "
+          + ", ".join(f"{u} -> {EMAIL_BY_NAME.get(u)}" for u in USER_LIST))
     print(f"Team leads (scope={TEAM_LEAD_SCOPE}): {TEAM_LEADS}")
 
     if not USER_LIST:
@@ -285,7 +318,7 @@ else:
         # -------------------------------------------------------------
         
         if by_user:
-            slack = pq.connect(SLACK_CONNECTION_NAME)
+            slack_token = pq.get_secret(SLACK_BOT_TOKEN_SECRET)
             for user in sorted(by_user):
                 lines = []
                 if today.weekday() == 4:
@@ -302,11 +335,11 @@ else:
                 lines.append("\nAdd/Edit your entries: <https://app.eu.peliqan.io/apps/dkV4ZE1JMW5obnhsblFJemM5anhKZEQ5UTZYWVp6TTNLZmhPRDJEcXZxeDljcnBndTBWcndnaWpIVmRoYjJwaw==/|Timesheet Calendar>")
                 text = "\n".join(lines)
 
-                result = slack.add("message", {
-                    "text": text,
-                    "channel": f"@{slack_handle_for(user)}",
-                })
-                print(f"Slack DM to {user}: {result}")
+                try:
+                    result = send_slack_dm(slack_token, user, text)
+                    print(f"Slack DM to {user}: {result}")
+                except Exception as exc:
+                    print(f"Slack DM to {user} FAILED: {exc}")
         else:
             print("No outstanding shortfalls - no employee DMs sent.")
         
@@ -345,12 +378,12 @@ else:
                     lines.append("")
                 digest_text = "\n".join(lines).rstrip()
 
-                slack = pq.connect(SLACK_CONNECTION_NAME)
+                slack_token = pq.get_secret(SLACK_BOT_TOKEN_SECRET)
                 for lead in TEAM_LEADS:
-                    result = slack.add("message", {
-                        "text": digest_text,
-                        "channel": f"@{slack_handle_for(lead)}",
-                    })
-                    print(f"Slack digest DM to team lead {lead}: {result}")
+                    try:
+                        result = send_slack_dm(slack_token, lead, digest_text)
+                        print(f"Slack digest DM to team lead {lead}: {result}")
+                    except Exception as exc:
+                        print(f"Slack digest DM to team lead {lead} FAILED: {exc}")
         else:
             print(f"Today ({today.isoformat()}) is not Monday - no team-lead digest sent.")
