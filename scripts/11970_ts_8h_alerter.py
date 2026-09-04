@@ -64,6 +64,7 @@ script edit.
 
 import json
 import time
+import urllib.parse
 import urllib.request
 from datetime import date, timedelta
 
@@ -143,12 +144,25 @@ def slack_api_call(token, method, payload):
     return body
 
 
+def slack_lookup_by_email(token, email):
+    """users.lookupByEmail is a GET method - it reads the email from the
+    query string, not a JSON body, unlike write methods such as
+    chat.postMessage. Sending it as JSON gets "invalid_arguments" back."""
+    url = f"{SLACK_API_BASE}/users.lookupByEmail?" + urllib.parse.urlencode({"email": email})
+    req = urllib.request.Request(url, headers={"Authorization": f"Bearer {token}"})
+    with urllib.request.urlopen(req, timeout=15) as resp:
+        body = json.loads(resp.read().decode("utf-8"))
+    if not body.get("ok"):
+        raise RuntimeError(f"Slack users.lookupByEmail failed: {body.get('error')}")
+    return body
+
+
 def slack_user_id_for(token, name):
     """This person's Slack user ID, resolved from their ts_prod.users email
     via users.lookupByEmail and cached in SLACK_USER_ID_BY_EMAIL."""
     email = str(EMAIL_BY_NAME.get(name) or "").strip().lower()
     if email not in SLACK_USER_ID_BY_EMAIL:
-        body = slack_api_call(token, "users.lookupByEmail", {"email": email})
+        body = slack_lookup_by_email(token, email)
         SLACK_USER_ID_BY_EMAIL[email] = body["user"]["id"]
     return SLACK_USER_ID_BY_EMAIL[email]
 
