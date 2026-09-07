@@ -874,7 +874,7 @@ def task_selectbox(lookup, key, current=None):
     index = ids.index(current) if current in ids else None
     return st.selectbox("Task", ids, index=index, key=key,
                         placeholder="Choose a task...",
-                        format_func=lambda i: f"{lookup[i]['client']} - {lookup[i]['task']}")
+                        format_func=lambda i: f"{lookup[i]['client']} - {lookup[i]['project']} - {lookup[i]['task']}")
 
 
 def existing_task_fields(info):
