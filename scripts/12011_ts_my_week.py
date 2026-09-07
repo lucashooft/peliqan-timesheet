@@ -145,13 +145,13 @@ PROJECT_CHOICES = None
 SLOT_MIN = 15                # add-target granularity, in minutes
 SLOTS_PER_H = 60 // SLOT_MIN
 
-# The quarter hours the start menu offers: 06:00 up to and including 21:45.
+# The quarter hours the start menu offers: 06:00 up to and including 20:45.
 # Nobody scrolls past midnight to find 09:00, and the hours outside this are
 # rare enough to be worth typing. They are NOT forbidden - anything typed is
 # still accepted, and an entry that already starts outside the range keeps
 # its own time in the list so the menu opens on it.
 MENU_FROM_H = 6
-MENU_TO_H = 22
+MENU_TO_H = 21
 
 # Whether st.selectbox can take a value outside its options. Peliqan pins its
 # own Streamlit and this app cannot choose it, so ask rather than assume: on a
@@ -2063,8 +2063,13 @@ for i, d in enumerate(days):
         fig.add_vrect(x0=i - 0.5, x1=i + 0.5, fillcolor="#eaf1fb",
                       opacity=0.55, layer="below", line_width=0)
 
+# Padding below the last hour: without it the bottom gridline sits exactly
+# on the plot's own edge and never renders, leaving the last row with no
+# closing line the way every row above it has one.
+GRID_BOTTOM_PAD_H = 0.15
+
 fig.update_layout(
-    height=(end_h - start_h) * ROW_PX,
+    height=(end_h - start_h + GRID_BOTTOM_PAD_H) * ROW_PX,
     margin=dict(l=8, r=8, t=30, b=8),
     plot_bgcolor="white",
     paper_bgcolor="rgba(0,0,0,0)",
@@ -2082,7 +2087,7 @@ fig.update_layout(
         tickfont=dict(size=11, color="#6e6e78"),
     ),
     yaxis=dict(
-        range=[end_h, start_h],            # morning on top
+        range=[end_h + GRID_BOTTOM_PAD_H, start_h],    # morning on top
         tickvals=list(range(start_h, end_h + 1)),
         ticktext=[f"{h:02d}:00" for h in range(start_h, end_h + 1)],
         fixedrange=True, zeroline=False, showline=False, ticks="",
