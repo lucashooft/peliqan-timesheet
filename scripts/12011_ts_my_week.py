@@ -145,13 +145,13 @@ PROJECT_CHOICES = None
 SLOT_MIN = 15                # add-target granularity, in minutes
 SLOTS_PER_H = 60 // SLOT_MIN
 
-# The quarter hours the start menu offers: 06:00 up to and including 19:45.
+# The quarter hours the start menu offers: 06:00 up to and including 21:45.
 # Nobody scrolls past midnight to find 09:00, and the hours outside this are
 # rare enough to be worth typing. They are NOT forbidden - anything typed is
 # still accepted, and an entry that already starts outside the range keeps
 # its own time in the list so the menu opens on it.
 MENU_FROM_H = 6
-MENU_TO_H = 20
+MENU_TO_H = 22
 
 # Whether st.selectbox can take a value outside its options. Peliqan pins its
 # own Streamlit and this app cannot choose it, so ask rather than assume: on a
@@ -160,7 +160,7 @@ MENU_TO_H = 20
 CAN_TYPE_NEW_OPTIONS = "accept_new_options" in inspect.signature(st.selectbox).parameters
 
 GRID_START_H = 7             # default visible range; auto-extends to fit
-GRID_END_H = 19
+GRID_END_H = 21
 ROW_PX = 52                  # pixels per hour row
 
 CLIENT_COLORS = ["#4c78a8", "#54a24b", "#b279a2", "#f58518",
