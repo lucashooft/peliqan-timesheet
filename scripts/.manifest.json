@@ -23,9 +23,9 @@
   "11383": {
     "filename": "11383_ts_mcp_server.py",
     "group": 3382,
-    "local_hash": "ff47af9c70d9d9168dd91ca8a8f1ad6bcc9b848a4ac9d9aa56fccc65347ccf8f",
+    "local_hash": "a5e68f779d9ae4e74505bb916bafc3434ad496f6b706672f73e4dfb5d84eec04",
     "name": "ts_mcp_server",
-    "remote_hash": "593c59194fd09fd5aa14018cd7485f1c169e17668900c5cd10bc32dbc9eac7ca"
+    "remote_hash": "774cbd6f806a8b56a976ff78f8d1570a6c6bcb80318da41ab5b8e993e4d50174"
   },
   "11954": {
     "filename": "11954_ts_bi_dashboard.py",
@@ -44,9 +44,9 @@
   "12011": {
     "filename": "12011_ts_my_week.py",
     "group": 3382,
-    "local_hash": "8f6f1b83f26ab4e8a37196407bbe408e3fec7a3cb65a727eec1ffafc97ccf2c9",
+    "local_hash": "e5a8c03fc3b8eee3162c47e76a61c449a6f485f8499b6d9c40e1088a86698383",
     "name": "ts_my_week",
-    "remote_hash": "95d8c509f514f177667913ee88fefb5dee4e23b36a97b2a8529a5f40fb84d70c"
+    "remote_hash": "3dda3ab0e9d7db4ed76b93cc0bff62e4067a76fda793d714bc8111985691354d"
   },
   "12507": {
     "filename": "12507_ts_monthly_view.py",
