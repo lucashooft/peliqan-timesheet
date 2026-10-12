@@ -86,7 +86,7 @@ NOTIFY_ONLY = None
 # applied last, so it always wins. A name or an email address both work,
 # matched case-insensitively: "Niko" and "niko@peliqan.io" exclude the same
 # person. Use the email where two people could share a first name.
-EXCLUDE = ["arthur@peliqan.io"]
+EXCLUDE = ["arthur@peliqan.io","lucas@peliqan.io"]
 
 # Same name/email matching as EXCLUDE, but only hides matching employees'
 # shortfall days from the Monday team-lead digest content - they're still

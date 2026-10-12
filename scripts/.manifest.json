@@ -37,16 +37,16 @@
   "11970": {
     "filename": "11970_ts_8h_alerter.py",
     "group": 3382,
-    "local_hash": "5f31f0db0b463e2708464bcd254a5b4fb74485419cdb4ccd3bfd70d5fe8309d2",
+    "local_hash": "ee749c12aa4668daf7aba2fed5d8936e666548ab5f79d53a01949eb9f63dcccd",
     "name": "ts_8h_alerter",
-    "remote_hash": "82343d9fe8bcd3df569a077dd653ced9da1d54b9fa68d645300fad590943e9f6"
+    "remote_hash": "8501771d9e5adab4bdfbca27f7f2426687df48d5e7ef0b56c42cc2b7fbab351a"
   },
   "12011": {
     "filename": "12011_ts_my_week.py",
     "group": 3382,
-    "local_hash": "ce998c3160389bbfab470247ce627db608d45be952e9769a725b45976a2ddea2",
+    "local_hash": "8f6f1b83f26ab4e8a37196407bbe408e3fec7a3cb65a727eec1ffafc97ccf2c9",
     "name": "ts_my_week",
-    "remote_hash": "f0334d866dab90961779ddfe69dcc4bac159c1102cee263b3d08cc1ec1f519f4"
+    "remote_hash": "95d8c509f514f177667913ee88fefb5dee4e23b36a97b2a8529a5f40fb84d70c"
   },
   "12507": {
     "filename": "12507_ts_monthly_view.py",
@@ -61,5 +61,12 @@
     "local_hash": "89a39b4d0bf90e057726dfed03b82f7784a95c1461820c4b105f5b12b616f769",
     "name": "ts_planner",
     "remote_hash": "a26d5e664bd6ac48b0b0c4648ad5ac1f8890d114044eefe8876850f3254d1cfc"
+  },
+  "13036": {
+    "filename": "13036_ts_insights.py",
+    "group": 3382,
+    "local_hash": "c4e4e3b6ae76e40fec69c1a69d4ce38c16184d43b35cb517718cd5557f5dbd01",
+    "name": "ts_insights",
+    "remote_hash": "c4e4e3b6ae76e40fec69c1a69d4ce38c16184d43b35cb517718cd5557f5dbd01"
   }
 }
