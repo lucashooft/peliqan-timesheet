@@ -60,6 +60,10 @@ ts_prod.users.scope, cumulative):
     are then locked for everyone, here and in ts_mcp_server, which refuses
     to write to them. (Those columns keep their database names; everything
     a user reads says validated.)
+  - A week that straddles a month boundary is two submission periods
+    (Monday to month end, the 1st to Sunday), each with its own Submit /
+    Unsubmit / Validate, so a month can be closed while the next month's
+    days in that week stay open. See week_periods.
 
 Navigation: a date picker ("Show week of") jumps to the week containing
 any date, with explicit "Previous week" / "Next week" buttons next to it
@@ -198,8 +202,39 @@ def monday_of(d):
     return d - timedelta(days=d.weekday())
 
 
-def submission_key(user_id, week_start):
-    return f"{int(user_id)}_{week_start.isoformat()}"
+def submission_key(user_id, period_start):
+    return f"{int(user_id)}_{period_start.isoformat()}"
+
+
+# Submitting works per period, not per week: a week that straddles a month
+# boundary is two periods (Monday to month end, the 1st to Sunday), so the
+# old month can be handed in without freezing the new month's days. A week
+# inside one month is a single period starting on its Monday, so its key is
+# what it always was. Duplicated as _period_start_of in ts_mcp_server, which
+# enforces the same lock - keep both in step.
+LOCKED_STATUSES = {"submitted": "submitted", "confirmed": "validated"}
+
+
+def period_start(d):
+    return max(monday_of(d), d.replace(day=1))
+
+
+def week_periods(week_start):
+    """[(start, end), ...] for the week: one period, or two across a month."""
+    week_end = week_start + timedelta(days=6)
+    if week_end.month == week_start.month:
+        return [(week_start, week_end)]
+    first = week_end.replace(day=1)
+    return [(week_start, first - timedelta(days=1)), (first, week_end)]
+
+
+def period_lock_error(user_id, d):
+    """Why entries on day d can't be written, or None when its period is open."""
+    status = (load_submissions(user_id).get(
+        submission_key(user_id, period_start(d))) or {}).get("status")
+    if status in LOCKED_STATUSES:
+        return f"{d.strftime('%d %b')} is in a period that has been {LOCKED_STATUSES[status]}."
+    return None
 
 
 def user_display_name(user):
@@ -647,6 +682,9 @@ def insert_entry(user_id, task_id, entry_dt, duration_minutes, note):
     """Write the entry, or return why it was refused. The write boundary
     re-checks even when the dialog already did: this is the last point
     before the row lands."""
+    lock = period_lock_error(user_id, entry_dt.date())
+    if lock:
+        return lock
     conflict = conflicting_entry(neighbour_rows(user_id, entry_dt.date()),
                                  entry_dt, duration_minutes)
     if conflict:
@@ -678,6 +716,11 @@ def update_entry(entry_id, user_id, task_id, entry_dt, duration_minutes, note,
     and refusing to let someone retitle one would punish them for a clash
     they did not make. Only a move is checked.
     """
+    # The dialog only opens on an open day, but its date picker can move
+    # the entry into a submitted period - the other half of a split week.
+    lock = period_lock_error(user_id, entry_dt.date())
+    if lock:
+        return lock
     if check_overlap:
         conflict = conflicting_entry(neighbour_rows(user_id, entry_dt.date()),
                                      entry_dt, duration_minutes,
@@ -703,6 +746,7 @@ def delete_entry(entry_id):
 
 
 def submit_week(user_id, week_start):
+    """week_start is the PERIOD start - see week_periods."""
     dbconn = pq.dbconnect(DW_NAME)
     key = submission_key(user_id, week_start)
     dbconn.upsert(DW_NAME, S, "timetable_submissions", key, {
@@ -726,10 +770,11 @@ def unsubmit_week(user_id, week_start):
     load_submissions.clear()
 
 
-def validate_week(user_id, week_start, validated_by_id, existing_submission):
-    """Validate a week. This function IS the contract the other surfaces
+def validate_week(user_id, week_start, week_end, validated_by_id, existing_submission):
+    """Validate a period (week_start..week_end, see week_periods). This
+    function IS the contract the other surfaces
     read back, so both halves matter: every timetable entry of the user in
-    that week gets approved=true + approved_by (the column names, kept as
+    that period gets approved=true + approved_by (the column names, kept as
     they are), and the submission row becomes status='confirmed'.
     ts_mcp_server refuses writes on a validated entry AND on a validated
     week; this app's grid goes read-only on either. Entries are stamped
@@ -738,7 +783,6 @@ def validate_week(user_id, week_start, validated_by_id, existing_submission):
     already-validated entry is a no-op."""
     dbconn = pq.dbconnect(DW_NAME)
     key = submission_key(user_id, week_start)
-    week_end = week_start + timedelta(days=6)
 
     rows = dbconn.fetch(DW_NAME, query=f"""
         SELECT id FROM {S}.timetable
@@ -1146,18 +1190,21 @@ def entry_dialog(entry, lookup, editable, user_id):
 
 
 @st.dialog("Submit week")
-def submit_dialog(user_id, week_start, day_totals):
-    week_end = week_start + timedelta(days=6)
+def submit_dialog(user_id, week_start, week_end, day_totals):
     st.write(f"Submit **{week_start.strftime('%d %b')} to {week_end.strftime('%d %b %Y')}** for validation?")
     shortfalls = []
-    for i in WORKDAYS:
-        total = day_totals.get(week_start + timedelta(days=i), 0)
-        if total >= DAY_TARGET_MIN:
-            st.markdown(f"{DAY_ABBREV[i]} - {fmt_dur(total)} - ok")
-        else:
-            shortfalls.append(i)
-            st.markdown(f"{DAY_ABBREV[i]} - {fmt_dur(total)} - **missing {fmt_dur(DAY_TARGET_MIN - total)}**")
-    st.caption("Submitting locks the week for editing until it is unsubmitted or validated.")
+    d = week_start
+    while d <= week_end:
+        i = d.weekday()
+        if i in WORKDAYS:
+            total = day_totals.get(d, 0)
+            if total >= DAY_TARGET_MIN:
+                st.markdown(f"{DAY_ABBREV[i]} - {fmt_dur(total)} - ok")
+            else:
+                shortfalls.append(i)
+                st.markdown(f"{DAY_ABBREV[i]} - {fmt_dur(total)} - **missing {fmt_dur(DAY_TARGET_MIN - total)}**")
+        d += timedelta(days=1)
+    st.caption("Submitting locks these days for editing until they are unsubmitted or validated.")
     if not shortfalls:
         if st.button("Submit week", type="primary", width='stretch', key="submit_ok"):
             submit_week(user_id, week_start)
@@ -1170,8 +1217,7 @@ def submit_dialog(user_id, week_start, day_totals):
 
 
 @st.dialog("Validate week")
-def validate_dialog(target_user, week_start, validated_by_id, existing_submission):
-    week_end = week_start + timedelta(days=6)
+def validate_dialog(target_user, week_start, week_end, validated_by_id, existing_submission):
     st.write(
         f"Validate the week of **{week_start.strftime('%d %b')} to {week_end.strftime('%d %b %Y')}** "
         f"for **{user_display_name(target_user)}**?"
@@ -1179,7 +1225,8 @@ def validate_dialog(target_user, week_start, validated_by_id, existing_submissio
     st.caption("This validates every entry in the week and marks the submission "
                "as confirmed. Validated entries can no longer be edited by anyone.")
     if st.button("Validate week", type="primary", width='stretch', key="validate_ok"):
-        validate_week(to_int(target_user.get("id")), week_start, validated_by_id, existing_submission)
+        validate_week(to_int(target_user.get("id")), week_start, week_end,
+                      validated_by_id, existing_submission)
         st.rerun()
 
 # =====================================================
@@ -1875,14 +1922,22 @@ week_start = st.session_state.week_start
 week_end = week_start + timedelta(days=6)
 days = [week_start + timedelta(days=i) for i in range(7)]
 
-submission = submissions.get(submission_key(viewing_id, week_start))
-wk_status = (submission or {}).get("status")
-is_locked_week = wk_status in ("submitted", "confirmed")
-is_confirmed = wk_status == "confirmed"
+# One period, or two when the week straddles a month - see week_periods.
+periods = []
+for p_start, p_end in week_periods(week_start):
+    sub = submissions.get(submission_key(viewing_id, p_start))
+    periods.append({"start": p_start, "end": p_end, "sub": sub,
+                    "status": (sub or {}).get("status")})
+is_split = len(periods) > 1
 
-can_edit = is_self and not is_locked_week   # add/edit/delete entries, and submit
-can_unsubmit = is_self and wk_status == "submitted"
-can_validate = can_manage and wk_status == "submitted"
+
+def can_edit_day(d):
+    """Add/edit/delete entries on day d: your own calendar, open period."""
+    p = next((p for p in periods if p["start"] <= d <= p["end"]), None)
+    return is_self and p is not None and p["status"] not in LOCKED_STATUSES
+
+
+can_edit = any(can_edit_day(d) for d in days)   # anything clickable at all
 
 week_df = entries[(entries["dt"].dt.date >= week_start) & (entries["dt"].dt.date <= week_end)] if not entries.empty else entries
 day_totals = {}
@@ -1899,9 +1954,9 @@ if pending:
         if not match.empty:
             e = match.iloc[0].to_dict()
             open_dialog()
-            entry_dialog(e, lookup, editable=can_edit and not is_true(e.get("approved")),
-                         user_id=viewing_id)
-    elif kind == "add" and can_edit:
+            entry_dialog(e, lookup, editable=can_edit_day(e["dt"].date())
+                         and not is_true(e.get("approved")), user_id=viewing_id)
+    elif kind == "add" and can_edit_day(pending[1]):
         # len check: a pending queued before slots existed carries no minute
         minute = pending[3] if len(pending) > 3 else 0
         open_dialog()
@@ -1939,24 +1994,31 @@ title_col.markdown(
 
 # Left column is always the validate action, right column always the
 # submit/unsubmit one, so a button never moves sideways as the week
-# changes state - it only appears or disappears.
-if is_confirmed:
-    by = user_by_id.get(to_int((submission or {}).get("confirmed_by")))
-    validate_col.success("Week validated" + (f" by {user_display_name(by)}" if by else ""))
-elif wk_status == "submitted":
-    if can_validate and validate_col.button("Validate", key="validate_btn",
-                                            type="primary", width='stretch'):
-        validate_dialog(viewing_user, week_start, viewer_id, submission)
-    if can_unsubmit and submit_col.button("Unsubmit", key="unsubmit_btn",
-                                          width='stretch'):
-        unsubmit_week(viewing_id, week_start)
-        st.rerun()
-elif can_edit:
-    if submit_col.button("Submit week", key="submit_week_btn",
-                         type="primary", width='stretch'):
-        submit_dialog(viewing_id, week_start, day_totals)
-else:
-    submit_col.caption("Week not submitted yet.")
+# changes state - it only appears or disappears. A week split across two
+# months stacks one set per period, each labelled with its days.
+for p in periods:
+    p_start, p_end, sub, status = p["start"], p["end"], p["sub"], p["status"]
+    span = (f" {p_start.day}-{p_end.strftime('%d %b')}" if p_start != p_end
+            else f" {p_end.strftime('%d %b')}") if is_split else ""
+    pkey = p_start.isoformat()
+    if status == "confirmed":
+        by = user_by_id.get(to_int((sub or {}).get("confirmed_by")))
+        validate_col.success((("Validated" + span) if is_split else "Week validated")
+                             + (f" by {user_display_name(by)}" if by else ""))
+    elif status == "submitted":
+        if can_manage and validate_col.button("Validate" + span, key=f"validate_btn_{pkey}",
+                                              type="primary", width='stretch'):
+            validate_dialog(viewing_user, p_start, p_end, viewer_id, sub)
+        if is_self and submit_col.button("Unsubmit" + span, key=f"unsubmit_btn_{pkey}",
+                                         width='stretch'):
+            unsubmit_week(viewing_id, p_start)
+            st.rerun()
+    elif is_self:
+        if submit_col.button(("Submit" + span) if is_split else "Submit week",
+                             key=f"submit_week_btn_{pkey}", type="primary", width='stretch'):
+            submit_dialog(viewing_id, p_start, p_end, day_totals)
+    else:
+        submit_col.caption(("Not submitted yet:" + span) if is_split else "Week not submitted yet.")
 
 # per-day 8h minimum summary (replaces the old weekly progress bar:
 # the target is a minimum of 8h per workday, not a 40h weekly pool)
@@ -1984,7 +2046,7 @@ for i, d in enumerate(days):
             f"<span style='color:{color};'> - {txt}</span></div>",    
             unsafe_allow_html=True,
         )
-        if can_edit:
+        if can_edit_day(d):
             if st.button("Add an entry", key=f"add_day_{d.isoformat()}",
                          help=f"Add an entry on {d.strftime('%a %d %b')}",
                          width='stretch'):
@@ -2000,6 +2062,9 @@ bars_df, untimed, start_h, end_h = build_grid_frames(week_df, days, lookup)
 # free hours only: an add target under an entry would let a click on a
 # block fall through and create an overlapping entry
 cells_df = build_cells_frame(days, start_h, end_h, bars_df)
+if not cells_df.empty:   # no add targets on a submitted half of a split week
+    cells_df = cells_df[cells_df["cell_day"].map(
+        lambda s: can_edit_day(date.fromisoformat(s)))]
 
 fig = go.Figure()
 
@@ -2119,7 +2184,7 @@ if cd:
             m = int(cd[3])
         except (TypeError, ValueError, IndexError):
             d, h, m = None, 9, 0
-        if d:
+        if d and can_edit_day(d):
             st.session_state.pending = ("add", d, max(0, min(23, h)),
                                         max(0, min(59, m)))
             st.session_state.cal_nonce += 1
@@ -2138,14 +2203,18 @@ if untimed:
         lbl = f"{e['dt'].strftime('%a %d')} - {fmt_dur(e['duration'])} - {info['client']}{lock}"
         if u_cols[j % len(u_cols)].button(lbl, key=f"u_{e['id']}", width='stretch'):
             open_dialog()
-            entry_dialog(e, lookup, editable=can_edit and not is_true(e.get("approved")),
-                         user_id=viewing_id)
+            entry_dialog(e, lookup, editable=can_edit_day(e["dt"].date())
+                         and not is_true(e.get("approved")), user_id=viewing_id)
 
-if is_confirmed:
+statuses = [p["status"] for p in periods]
+if all(s == "confirmed" for s in statuses):
     st.caption("Week is validated: all entries are validated and read-only.")
-elif wk_status == "submitted":
+elif all(s in LOCKED_STATUSES for s in statuses):
     st.caption("Week is submitted: the grid is read-only."
                + (" Use Unsubmit to make changes." if is_self else ""))
+elif any(s in LOCKED_STATUSES for s in statuses):
+    st.caption("This week spans two months; the days of a submitted or "
+               "validated month are read-only.")
 elif not can_edit:
     # Someone else's open week. An open week of your own needs no caption:
     # it is editable, which the grid already shows by being clickable.

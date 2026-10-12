@@ -291,6 +291,14 @@ Changes from v3.20:
     weeks (UI only), reading anyone's data via run_report_query, and
     granting or revoking client access. Scope 3 keeps teams, user_roles and
     now users. 22 tools.
+
+Changes from v3.21:
+  - A week that straddles a month boundary is now two submission periods
+    (Monday to month end, the 1st to Sunday), submitted and validated
+    separately in ts_my_week, so the old month can be closed without
+    freezing the new month's days. _week_lock_error keys on the period
+    start (_period_start_of) instead of the Monday. Weeks inside one month
+    are unchanged, and so are existing submission rows.
 """
 
 import json
@@ -703,19 +711,25 @@ def _overlap_error(user_id, date_value, duration, exclude_id=None):
     return None
 
 
-def _week_start_of(value):
-    """Monday of the week a timetable 'date' falls in, or None if unreadable."""
+def _period_start_of(value):
+    """
+    Start of the submission period a timetable 'date' falls in, or None if
+    unreadable: its week's Monday, or the 1st when the month changes
+    mid-week - a straddling week is two periods, locked separately.
+    Duplicated as period_start in ts_my_week; keep both in step.
+    """
     # An unread date here must fail OPEN - reporting it is the field-level
     # checks' job - so a locked week is never let through on a parse error.
     parsed = _parse_entry_datetime(value)
     if parsed is None:
         return None
-    return parsed.date() - timedelta(days=parsed.weekday())
+    d = parsed.date()
+    return max(d - timedelta(days=d.weekday()), d.replace(day=1))
 
 
 def _week_lock_error(user_id, entry_date, action):
-    """The reason this week is closed, or None when it is open."""
-    week_start = _week_start_of(entry_date)
+    """The reason this period is closed, or None when it is open."""
+    week_start = _period_start_of(entry_date)
     if week_start is None:
         return None      # unreadable date: the field-level checks report that
     for row in fetch_cached("ts_prod", SUBMISSIONS_TABLE):
@@ -726,8 +740,8 @@ def _week_lock_error(user_id, entry_date, action):
         status = str(row.get("status") or "").strip().lower()
         state = LOCKED_WEEK_STATUSES.get(status)
         if state:
-            hint = " Unsubmit that week first." if status == "submitted" else ""
-            return (f"The week of {week_start.isoformat()} has been {state} "
+            hint = " Unsubmit it first." if status == "submitted" else ""
+            return (f"The period starting {week_start.isoformat()} has been {state} "
                     f"and is locked: {action}.{hint}")
     return None
 
